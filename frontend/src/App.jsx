@@ -1,71 +1,69 @@
 import { useState, useRef, useEffect } from 'react'
 import './App.css'
 
-const API_BASE_URL = 'http://localhost:8000'
+const API_BASE_URL = 'http://139.59.19.169:8000'
 
-// Screen states
 const SCREENS = {
-  HOME: 'home',
-  UPLOAD: 'upload',
+  MAIN: 'main',
   RECORD: 'record',
+  UPLOAD: 'upload',
+  REVIEW: 'review', // New Review Sheet
+  WORKSPACE: 'workspace', // Transcript + Chat
   PROCESSING: 'processing',
-  CHAT: 'chat'
 }
 
-// Processing states
 const PROCESS_STATUS = {
   IDLE: 'idle',
-  PREPARING: 'preparing',
   UPLOADING: 'uploading',
-  PROCESSING: 'processing',
+  TRANSCRIBING: 'transcribing',
+  INDEXING: 'indexing',
   READY: 'ready',
   FAILED: 'failed'
 }
 
 function App() {
-  // Navigation state
-  const [currentScreen, setCurrentScreen] = useState(SCREENS.HOME)
-  
-  // Audio state
-  const [selectedFile, setSelectedFile] = useState(null)
+  const [currentScreen, setCurrentScreen] = useState(SCREENS.MAIN)
   const [processStatus, setProcessStatus] = useState(PROCESS_STATUS.IDLE)
+  const [selectedFile, setSelectedFile] = useState(null)
   const [uploadProgress, setUploadProgress] = useState(0)
-  const [currentAudioKey, setCurrentAudioKey] = useState(null)
-  const [chunksIndexed, setChunksIndexed] = useState(0)
-  
-  // Recording state
+  const [messages, setMessages] = useState([])
+  const [inputQuery, setInputQuery] = useState('')
+  const [isThinking, setIsThinking] = useState(false)
+  const [errorMessage, setErrorMessage] = useState('')
   const [isRecording, setIsRecording] = useState(false)
   const [recordingTime, setRecordingTime] = useState(0)
+  const [activeTab, setActiveTab] = useState('chat') 
+  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [library, setLibrary] = useState([])
+  const [recordingName, setRecordingName] = useState('') // Name for current session
+  
+  // Highlighting state for source verification
+  const [highlightedTimestamp, setHighlightedTimestamp] = useState(null)
+  
+  const [currentTranscript, setCurrentTranscript] = useState([
+    { speaker: 'Speaker 1', timestamp: '0:00', text: 'Welcome to the strategy session. We are here to talk about the Q3 expansion.' },
+    { speaker: 'Speaker 2', timestamp: '0:15', text: 'The focus should be on European markets specifically.' },
+    { speaker: 'Speaker 1', timestamp: '0:42', text: 'Agreed. Let’s look at the budget allocation for Berlin and Paris.' }
+  ])
+  
   const mediaRecorderRef = useRef(null)
   const audioChunksRef = useRef([])
   const recordingTimerRef = useRef(null)
   const fileInputRef = useRef(null)
-  
-  // Chat state
-  const [messages, setMessages] = useState([])
-  const [inputQuery, setInputQuery] = useState('')
-  const [isThinking, setIsThinking] = useState(false)
-  
-  // Error state
-  const [errorMessage, setErrorMessage] = useState('')
+  const chatEndRef = useRef(null)
 
-  // Recording timer
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages, isThinking])
+
   useEffect(() => {
     if (isRecording) {
-      recordingTimerRef.current = setInterval(() => {
-        setRecordingTime(prev => prev + 1)
-      }, 1000)
+      recordingTimerRef.current = setInterval(() => setRecordingTime(prev => prev + 1), 1000)
     } else {
-      if (recordingTimerRef.current) {
-        clearInterval(recordingTimerRef.current)
-      }
+      clearInterval(recordingTimerRef.current)
       setRecordingTime(0)
     }
-    return () => {
-      if (recordingTimerRef.current) {
-        clearInterval(recordingTimerRef.current)
-      }
-    }
+    return () => clearInterval(recordingTimerRef.current)
   }, [isRecording])
 
   const formatTime = (seconds) => {
@@ -74,597 +72,582 @@ function App() {
     return `${mins}:${secs.toString().padStart(2, '0')}`
   }
 
+  // --- ACTIONS ---
+
+  const handleFileSelect = (e) => {
+    const file = e.target.files[0]
+    if (file && file.type.startsWith('audio/')) {
+      setSelectedFile(file)
+      setCurrentScreen(SCREENS.UPLOAD)
+    }
+  }
+
   const startRecording = async () => {
+    setErrorMessage('')
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const mediaRecorder = new MediaRecorder(stream)
+      
+      // Determine best supported mime type
+      const types = ['audio/webm', 'audio/ogg', 'audio/mp4', 'audio/wav']
+      const supportedType = types.find(type => MediaRecorder.isTypeSupported(type)) || ''
+      
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: supportedType })
       mediaRecorderRef.current = mediaRecorder
       audioChunksRef.current = []
-
-      mediaRecorder.ondataavailable = (event) => {
-        audioChunksRef.current.push(event.data)
+      
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) {
+          audioChunksRef.current.push(e.data)
+        }
       }
-
+      
       mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
-        const audioFile = new File([audioBlob], `recording_${Date.now()}.webm`, { type: 'audio/webm' })
-        setSelectedFile(audioFile)
-        stream.getTracks().forEach(track => track.stop())
-        setCurrentScreen(SCREENS.UPLOAD)
+        const audioBlob = new Blob(audioChunksRef.current, { type: supportedType || 'audio/wav' })
+        const extension = supportedType.split('/')[1] || 'wav'
+        const file = new File([audioBlob], `recording_${Date.now()}.${extension}`, { 
+          type: supportedType || 'audio/wav' 
+        })
+        
+        setSelectedFile(file)
+        setRecordingName(`Recording ${new Date().toLocaleDateString()}`)
+        setCurrentScreen(SCREENS.REVIEW) // Move to Review Screen instead of auto-upload
+        
+        stream.getTracks().forEach(t => t.stop())
       }
 
-      mediaRecorder.start()
+      // Record in 1-second chunks for better reliability
+      mediaRecorder.start(1000)
       setIsRecording(true)
-      setErrorMessage('')
     } catch (err) {
+      console.error('Recording error:', err)
       if (err.name === 'NotAllowedError') {
-        setErrorMessage('Microphone access denied. Please enable it in your browser settings.')
+        setErrorMessage('Microphone access was denied. Please check your browser permissions.')
       } else {
-        setErrorMessage('Could not access your microphone. Please check your device settings.')
+        setErrorMessage('Could not start recording. Please check your microphone connection.')
       }
     }
   }
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop()
-      setIsRecording(false)
     }
+    setIsRecording(false)
   }
 
-  const handleFileSelect = (e) => {
-    const file = e.target.files[0]
-    if (file) {
-      if (!file.type.startsWith('audio/')) {
-        setErrorMessage('Please select a valid audio file.')
-        return
-      }
-      setSelectedFile(file)
-      setCurrentScreen(SCREENS.UPLOAD)
-      setErrorMessage('')
+  const cancelRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.onstop = null // Prevent triggering the save logic
+      mediaRecorderRef.current.stop()
+      mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop())
     }
+    setIsRecording(false)
+    setCurrentScreen(SCREENS.MAIN)
   }
 
   const uploadAndProcess = async () => {
-    if (!selectedFile) return
-
-    setProcessStatus(PROCESS_STATUS.PREPARING)
+    setProcessStatus(PROCESS_STATUS.UPLOADING)
     setCurrentScreen(SCREENS.PROCESSING)
     setErrorMessage('')
-
+    
     try {
-      // Step 1: Generate upload URL
-      const uploadUrlResponse = await fetch(`${API_BASE_URL}/generate-upload-url`, {
+      // Step 1: Generate pre-signed URL
+      const res = await fetch(`${API_BASE_URL}/generate-upload-url`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          filename: selectedFile.name,
-          mime: selectedFile.type
+        body: JSON.stringify({ 
+          filename: selectedFile.name, 
+          mime: selectedFile.type 
         })
       })
-
-      if (!uploadUrlResponse.ok) {
-        throw new Error('prepare')
-      }
-
-      const { upload_url, object_key } = await uploadUrlResponse.json()
+      
+      if (!res.ok) throw new Error('Failed to generate upload URL')
+      const { upload_url, object_key } = await res.json()
 
       // Step 2: Upload to S3
-      setProcessStatus(PROCESS_STATUS.UPLOADING)
-      setUploadProgress(0)
-
-      const xhr = new XMLHttpRequest()
+      const uploadRes = await fetch(upload_url, { 
+        method: 'PUT', 
+        body: selectedFile, 
+        headers: { 'Content-Type': selectedFile.type } 
+      })
       
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) {
-          const percent = Math.round((e.loaded / e.total) * 100)
-          setUploadProgress(percent)
-        }
-      }
+      if (!uploadRes.ok) throw new Error('S3 upload failed')
+      
+      // Step 3: Trigger processing
+      setProcessStatus(PROCESS_STATUS.TRANSCRIBING)
+      const procRes = await fetch(`${API_BASE_URL}/process-audio`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ audio_key: object_key })
+      })
+      
+      if (!procRes.ok) throw new Error('Processing failed')
+      
+      // Response is a string
+      const processMsg = await procRes.json()
+      console.log('Processing:', processMsg)
 
-      xhr.onload = async () => {
-        if (xhr.status === 200) {
-          // Step 3: Trigger processing
-          setProcessStatus(PROCESS_STATUS.PROCESSING)
-          
-          try {
-            const processResponse = await fetch(`${API_BASE_URL}/process-audio`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ audio_key: object_key })
-            })
-
-            if (!processResponse.ok) {
-              throw new Error('process')
-            }
-
-            const result = await processResponse.json()
-            setCurrentAudioKey(object_key)
-            setChunksIndexed(result.chunks || 0)
-            setProcessStatus(PROCESS_STATUS.READY)
-            
-            // Auto-navigate to chat after brief delay
-            setTimeout(() => {
-              setCurrentScreen(SCREENS.CHAT)
-            }, 1500)
-            
-          } catch (err) {
-            setProcessStatus(PROCESS_STATUS.FAILED)
-            setErrorMessage('Transcription failed. Your audio might be too long or in an unsupported format.')
-          }
-        } else {
-          throw new Error('upload')
-        }
-      }
-
-      xhr.onerror = () => {
-        setProcessStatus(PROCESS_STATUS.FAILED)
-        setErrorMessage('Upload failed. Please check your connection and try again.')
-      }
-
-      xhr.open('PUT', upload_url)
-      xhr.setRequestHeader('Content-Type', selectedFile.type)
-      xhr.send(selectedFile)
-
+      setProcessStatus(PROCESS_STATUS.INDEXING)
+      await new Promise(r => setTimeout(r, 1000))
+      
+      setProcessStatus(PROCESS_STATUS.READY)
+      setTimeout(() => setCurrentScreen(SCREENS.MAIN), 800)
     } catch (err) {
       setProcessStatus(PROCESS_STATUS.FAILED)
-      if (err.message === 'prepare') {
-        setErrorMessage('Could not prepare the upload. Please try again.')
-      } else {
-        setErrorMessage('Something went wrong. Please try again.')
-      }
+      setErrorMessage(err.message || 'Failed to process audio.')
     }
   }
 
   const askQuestion = async () => {
     if (!inputQuery.trim()) return
-
-    const userMessage = { role: 'user', content: inputQuery }
-    setMessages(prev => [...prev, userMessage])
+    const userMsg = { role: 'user', content: inputQuery }
+    setMessages(prev => [...prev, userMsg])
+    const currentQuery = inputQuery
     setInputQuery('')
     setIsThinking(true)
     setErrorMessage('')
 
     try {
-      const response = await fetch(`${API_BASE_URL}/ask`, {
+      const res = await fetch(`${API_BASE_URL}/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: userMessage.content })
+        body: JSON.stringify({ query: currentQuery })
       })
-
-      if (!response.ok) {
-        throw new Error('ask')
-      }
-
-      const result = await response.json()
-      const assistantMessage = { 
-        role: 'assistant', 
-        content: typeof result === 'string' ? result : result.answer || JSON.stringify(result)
-      }
-      setMessages(prev => [...prev, assistantMessage])
       
+      if (!res.ok) throw new Error('Failed to get answer')
+      
+      // Response is a string
+      const answer = await res.json()
+      
+      setMessages(prev => [...prev, { 
+        role: 'assistant', 
+        content: answer,
+        sources: [] 
+      }])
     } catch (err) {
-      setErrorMessage('Could not generate an answer from your audio yet. Please try again.')
-      setMessages(prev => prev.slice(0, -1)) // Remove user message on failure
+      setErrorMessage('Error getting response.')
     } finally {
       setIsThinking(false)
     }
   }
 
-  const resetApp = () => {
-    setCurrentScreen(SCREENS.HOME)
-    setSelectedFile(null)
-    setProcessStatus(PROCESS_STATUS.IDLE)
-    setUploadProgress(0)
-    setCurrentAudioKey(null)
-    setChunksIndexed(0)
-    setMessages([])
-    setInputQuery('')
-    setErrorMessage('')
-  }
+  // --- UI COMPONENTS ---
 
-  // HOME SCREEN
-  if (currentScreen === SCREENS.HOME) {
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800 flex items-center justify-center px-4">
-        <div className="w-full max-w-md space-y-8">
-          
-          <div className="text-center">
-            <div className="text-6xl mb-4">🎙️</div>
-            <h1 className="text-3xl md:text-4xl font-bold text-gray-900 dark:text-white mb-3">
-              Voice Memory
-            </h1>
-            <p className="text-gray-600 dark:text-gray-300 text-sm md:text-base">
-              Record or upload audio, then ask questions about what was said
-            </p>
-          </div>
-
-          <div className="space-y-3">
-            <button
-              onClick={() => setCurrentScreen(SCREENS.RECORD)}
-              className="w-full py-5 px-6 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold rounded-2xl transition-colors shadow-lg text-lg flex items-center justify-center gap-3"
-            >
-              <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
-                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
-              </svg>
-              Record Audio
-            </button>
-
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="w-full py-5 px-6 bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-900 dark:text-white font-semibold rounded-2xl transition-colors shadow-lg text-lg border-2 border-gray-200 dark:border-gray-700 flex items-center justify-center gap-3"
-            >
-              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-              </svg>
-              Upload Audio
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="audio/*"
-              onChange={handleFileSelect}
-              className="hidden"
-            />
-          </div>
-
-          {errorMessage && (
-            <div className="p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl">
-              <p className="text-sm text-red-800 dark:text-red-300">{errorMessage}</p>
+  const Sidebar = () => (
+    <>
+      {/* Mobile Backdrop */}
+      {sidebarOpen && (
+        <div 
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[60] md:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+      
+      <aside className={`
+        fixed md:relative top-0 left-0 bottom-0 
+        ${sidebarOpen ? 'w-72' : 'w-0 -translate-x-full md:translate-x-0 md:w-0'} 
+        bg-[#f9f9f9] dark:bg-[#171717] border-r border-slate-200 dark:border-white/10 
+        transition-all duration-300 ease-in-out z-[70] overflow-hidden flex flex-col
+      `}>
+        <div className="p-6 flex flex-col h-full min-w-[288px]">
+          <div className="flex items-center justify-between mb-10 px-1">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 bg-[#10a37f] rounded-xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/20">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
+              </div>
+              <span className="font-bold text-xl tracking-tight dark:text-white">VoiceMemory</span>
             </div>
-          )}
+            <button onClick={() => setSidebarOpen(false)} className="md:hidden p-2 hover:bg-slate-200 dark:hover:bg-white/5 rounded-lg transition-colors">
+              <svg className="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+            </button>
+          </div>
+
+          <div className="space-y-3 mb-10">
+            <button 
+              onClick={() => { setMessages([]); if(window.innerWidth < 768) setSidebarOpen(false); }}
+              className="w-full flex items-center gap-3 px-4 py-3 bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-2xl hover:bg-slate-50 dark:hover:bg-white/10 transition-all text-sm font-bold active:scale-[0.98] mb-6"
+            >
+              <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+              New Chat Thread
+            </button>
+
+            <button 
+              onClick={() => { setCurrentScreen(SCREENS.RECORD); if(window.innerWidth < 768) setSidebarOpen(false); }}
+              className="w-full flex items-center gap-3 px-4 py-3.5 bg-[#10a37f] text-white rounded-2xl hover:bg-[#1a7f64] transition-all text-sm font-bold shadow-md active:scale-[0.98]"
+            >
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+              Record New Audio
+            </button>
+            
+            <button 
+              onClick={() => { fileInputRef.current.click(); if(window.innerWidth < 768) setSidebarOpen(false); }}
+              className="w-full flex items-center gap-3 px-4 py-3.5 bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-2xl hover:bg-slate-50 dark:hover:bg-white/10 transition-all text-sm font-bold active:scale-[0.98]"
+            >
+              <svg className="w-5 h-5 text-[#10a37f]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
+              Upload Audio File
+            </button>
+            <input ref={fileInputRef} type="file" accept="audio/*" onChange={handleFileSelect} className="hidden" />
+          </div>
+          
+          <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar">
+            <div className="p-5 rounded-3xl bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 shadow-sm relative overflow-hidden group">
+              <div className="absolute top-0 right-0 p-3 opacity-10 group-hover:scale-110 transition-transform">
+                <svg className="w-12 h-12 text-[#10a37f]" fill="currentColor" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+              </div>
+              <p className="text-[10px] font-bold text-[#10a37f] uppercase tracking-[0.2em] mb-3">System Status</p>
+              <h4 className="text-sm font-bold mb-2 dark:text-white">Unified Knowledge Base</h4>
+              <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed italic">
+                Your recordings are indexed into a global memory. AI responses are cross-referenced across all content.
+              </p>
+              <div className="mt-4 flex items-center gap-2">
+                <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
+                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Active & Ready</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-auto pt-6 border-t border-slate-200 dark:border-white/10">
+            <div className="flex items-center gap-3 px-2 py-3 rounded-2xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors cursor-pointer group">
+              <div className="w-10 h-10 rounded-full bg-indigo-500 flex items-center justify-center text-xs text-white font-bold border-2 border-white dark:border-white/10 shadow-sm group-hover:scale-105 transition-transform">JD</div>
+              <div className="flex-1 truncate">
+                <span className="block text-sm font-bold dark:text-white">John Doe</span>
+                <span className="text-[10px] text-[#10a37f] font-bold uppercase tracking-tighter">Pro Plan</span>
+              </div>
+              <svg className="w-4 h-4 text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </>
+  )
+
+  const MainHeader = () => (
+    <header className="h-16 md:h-20 border-b border-slate-200 dark:border-white/10 px-4 md:px-8 flex items-center justify-between sticky top-0 z-50 glass-header">
+      <div className="flex items-center gap-4 md:gap-6">
+        <button 
+          onClick={() => setSidebarOpen(!sidebarOpen)}
+          className="p-2.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded-xl transition-all text-slate-500 active:scale-95"
+        >
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
+        </button>
+        <div className="h-6 w-[1px] bg-slate-200 dark:bg-white/10 hidden md:block" />
+        <div>
+          <h2 className="text-sm font-bold dark:text-white hidden md:block uppercase tracking-[0.15em] text-slate-400">Global AI Intelligence</h2>
+          <div className="md:hidden font-extrabold text-lg tracking-tight dark:text-white flex items-center gap-2">
+            <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-pulse"></div>
+            VoiceMemory
+          </div>
+        </div>
+      </div>
+      
+      <div className="flex items-center gap-2 md:gap-4">
+        {/* Quick Intake Button for Mobile */}
+        <button 
+          onClick={() => setCurrentScreen(SCREENS.RECORD)}
+          className="md:hidden p-2.5 bg-[#10a37f]/10 text-[#10a37f] rounded-xl active:scale-90 transition-transform"
+        >
+          <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+        </button>
+        
+        <div className="hidden md:flex items-center gap-2 px-4 py-2 bg-[#10a37f]/5 rounded-full border border-[#10a37f]/10 transition-all hover:bg-[#10a37f]/10 cursor-default group">
+          <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-pulse"></div>
+          <span className="text-[11px] font-bold text-[#10a37f] uppercase tracking-widest">Global Memory Active</span>
+        </div>
+        
+        <button className="p-2.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded-xl text-slate-500 transition-all active:scale-95">
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" /></svg>
+        </button>
+      </div>
+    </header>
+  )
+
+  // --- SCREENS ---
+
+  if (currentScreen === SCREENS.REVIEW) {
+    return (
+      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-end md:items-center justify-center relative overflow-hidden">
+        {/* Immersive Background */}
+        <div className="absolute inset-0 bg-[#10a37f]/5 pointer-events-none" />
+        
+        <div className="w-full max-w-lg bg-white dark:bg-[#171717] rounded-t-[2.5rem] md:rounded-[2.5rem] p-8 md:p-10 shadow-2xl border-t md:border border-slate-200 dark:border-white/10 animate-fade-in z-10">
+          <div className="text-center mb-8">
+            <div className="w-16 h-1 bg-slate-200 dark:bg-white/10 rounded-full mx-auto mb-8 md:hidden" />
+            <h2 className="text-2xl font-bold tracking-tight mb-2">Review Recording</h2>
+            <p className="text-sm text-slate-500">Ready to index this into your global memory?</p>
+          </div>
+
+          <div className="space-y-6">
+            <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border border-slate-200 dark:border-white/10">
+              <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2 px-1">Session Name</label>
+              <input 
+                type="text" 
+                value={recordingName}
+                onChange={(e) => setRecordingName(e.target.value)}
+                className="w-full bg-transparent text-lg font-bold focus:outline-none dark:text-white px-1"
+                placeholder="Give it a name..."
+              />
+            </div>
+
+            <div className="flex items-center justify-between px-4 py-3 bg-slate-50 dark:bg-white/5 rounded-2xl">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-[#10a37f]/10 text-[#10a37f] rounded-xl flex items-center justify-center">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                </div>
+                <div>
+                  <p className="text-xs font-bold dark:text-white uppercase tracking-tighter">Audio Clip</p>
+                  <p className="text-[10px] text-slate-500 font-bold uppercase">{formatTime(recordingTime)} Duration</p>
+                </div>
+              </div>
+              <button className="p-2 text-[#10a37f] hover:bg-[#10a37f]/10 rounded-lg transition-colors">
+                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 pt-4">
+              <button 
+                onClick={uploadAndProcess} 
+                className="w-full py-4 bg-[#10a37f] text-white font-bold rounded-2xl shadow-lg shadow-[#10a37f]/20 hover:bg-[#1a7f64] transition-all active:scale-[0.98]"
+              >
+                Transcribe & Index
+              </button>
+              <button 
+                onClick={() => { setSelectedFile(null); setCurrentScreen(SCREENS.MAIN); }}
+                className="w-full py-4 text-slate-500 dark:text-white/40 font-bold text-sm hover:text-red-500 transition-colors"
+              >
+                Discard Recording
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     )
   }
+  if (currentScreen === SCREENS.MAIN) {
+    return (
+      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden relative">
+        <Sidebar />
+        <main className="flex-1 flex flex-col overflow-hidden relative">
+          <MainHeader />
+          
+          <div className="flex-1 flex flex-col bg-white dark:bg-[#0d0d0d] overflow-hidden relative">
+            <div className="flex-1 overflow-y-auto px-4 md:px-0 scroll-smooth custom-scrollbar">
+              <div className="max-w-3xl mx-auto py-10 md:py-16 space-y-12 animate-fade-in pb-32">
+                {messages.length === 0 && (
+                  <div className="text-center py-20 px-6 max-w-xl mx-auto">
+                    <div className="w-24 h-24 bg-[#10a37f]/5 dark:bg-[#10a37f]/10 rounded-[2.5rem] flex items-center justify-center mx-auto mb-10 text-4xl shadow-inner border border-[#10a37f]/10 animate-bounce-subtle">🎙️</div>
+                    <h3 className="text-3xl font-bold mb-4 dark:text-white tracking-tight">How can I help you today?</h3>
+                    <p className="text-base text-slate-500 dark:text-slate-400 leading-relaxed max-w-md mx-auto">
+                      Ask me anything about your recorded conversations. I can summarize sessions, find specific details, or cross-reference facts.
+                    </p>
+                    
+                    <div className="mt-12 grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <button onClick={() => setInputQuery("Summarize our last roadmap discussion")} className="p-4 text-sm font-semibold bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-2xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 transition-all text-left group shadow-sm active:scale-95">
+                        <span className="block text-[#10a37f] mb-1 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] uppercase tracking-widest font-bold">Example</span>
+                        "Summarize our last roadmap discussion"
+                      </button>
+                      <button onClick={() => setInputQuery("What were the action items for the marketing team?")} className="p-4 text-sm font-semibold bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-2xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 transition-all text-left group shadow-sm active:scale-95">
+                        <span className="block text-[#10a37f] mb-1 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] uppercase tracking-widest font-bold">Example</span>
+                        "What were the action items for the marketing team?"
+                      </button>
+                    </div>
+                  </div>
+                )}
+                
+                {messages.map((msg, i) => (
+                  <div key={i} className={`flex gap-3 md:gap-8 ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in`}>
+                    {msg.role === 'assistant' && (
+                      <div className="w-8 h-8 md:w-9 md:h-9 rounded-xl bg-[#10a37f] text-white flex items-center justify-center flex-shrink-0 mt-1 shadow-lg shadow-[#10a37f]/20">
+                        <svg className="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                      </div>
+                    )}
+                    <div className={`max-w-[88%] md:max-w-[85%] rounded-[1.5rem] md:rounded-3xl ${msg.role === 'user' ? 'bg-[#10a37f] text-white px-5 py-3 md:px-6 md:py-3.5 w-fit ml-auto rounded-tr-sm shadow-md' : 'bg-transparent text-slate-800 dark:text-white/95'}`}>
+                      <div className={`text-[15px] md:text-[16px] leading-[1.6] whitespace-pre-wrap ${msg.role === 'user' ? 'font-medium' : 'font-normal'}`}>
+                        {msg.content}
+                      </div>
+                      {msg.sources && msg.sources.length > 0 && (
+                        <div className="mt-6 flex flex-wrap gap-2 pt-5 border-t border-slate-200 dark:border-white/10">
+                          {msg.sources.map(s => (
+                            <button key={s} className="text-[10px] font-bold text-[#10a37f] bg-[#10a37f]/10 px-3 py-1.5 rounded-full hover:bg-[#10a37f]/20 border border-[#10a37f]/20 transition-all uppercase tracking-[0.1em]">Ref: {s}</button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    {msg.role === 'user' && (
+                      <div className="w-8 h-8 md:w-9 md:h-9 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center flex-shrink-0 text-[10px] font-bold mt-1 uppercase border border-slate-200 dark:border-white/10 dark:text-white shadow-sm hidden md:flex">JD</div>
+                    )}
+                  </div>
+                ))}
+                
+                {isThinking && (
+                  <div className="flex gap-3 md:gap-8 animate-fade-in">
+                    <div className="w-8 h-8 md:w-9 md:h-9 rounded-xl bg-[#10a37f] text-white flex items-center justify-center flex-shrink-0 shadow-lg shadow-[#10a37f]/20">
+                       <svg className="w-4 h-4 md:w-5 md:h-5 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                    </div>
+                    <div className="flex items-center gap-1.5 md:gap-2 mt-4">
+                      <div className="w-1.5 h-1.5 md:w-2 md:h-2 bg-slate-300 dark:bg-[#10a37f]/40 rounded-full animate-bounce"></div>
+                      <div className="w-1.5 h-1.5 md:w-2 md:h-2 bg-slate-300 dark:bg-[#10a37f]/40 rounded-full animate-bounce [animation-delay:0.2s]"></div>
+                      <div className="w-1.5 h-1.5 md:w-2 md:h-2 bg-slate-300 dark:bg-[#10a37f]/40 rounded-full animate-bounce [animation-delay:0.4s]"></div>
+                    </div>
+                  </div>
+                )}
+                <div ref={chatEndRef} />
+              </div>
+            </div>
 
-  // RECORD SCREEN
+            {/* Mobile Bottom Bar (App Store Style) */}
+            <div className="md:hidden fixed bottom-0 left-0 right-0 bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl border-t border-slate-200 dark:border-white/10 px-6 py-3 flex justify-between items-center z-[100] pb-safe">
+              <button onClick={() => setSidebarOpen(true)} className="flex flex-col items-center gap-1 text-slate-400">
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
+                <span className="text-[9px] font-bold uppercase tracking-widest">Library</span>
+              </button>
+              <button 
+                onClick={() => setCurrentScreen(SCREENS.RECORD)}
+                className="w-14 h-14 bg-[#10a37f] rounded-2xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/30 -mt-8 border-4 border-white dark:border-[#0d0d0d] active:scale-90 transition-transform"
+              >
+                <svg className="w-7 h-7" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+              </button>
+              <button onClick={() => setMessages([])} className="flex flex-col items-center gap-1 text-slate-400">
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                <span className="text-[9px] font-bold uppercase tracking-widest">New</span>
+              </button>
+            </div>
+
+            {/* Chat Input Container */}
+            <div className="px-4 pb-20 md:pb-10 pt-2 bg-gradient-to-t from-white dark:from-[#0d0d0d] via-white dark:via-[#0d0d0d] to-transparent z-40">
+              <div className="max-w-3xl mx-auto relative group">
+                <textarea 
+                  value={inputQuery}
+                  onChange={(e) => setInputQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), askQuestion())}
+                  placeholder="Ask about your audio..."
+                  className="w-full pl-6 pr-14 md:pr-16 py-4 md:py-5 bg-white dark:bg-[#171717] border border-slate-200 dark:border-white/10 rounded-[1.5rem] md:rounded-[2rem] shadow-2xl focus:ring-2 focus:ring-[#10a37f]/30 focus:border-[#10a37f]/50 transition-all resize-none text-[15px] placeholder-slate-400 dark:text-white leading-relaxed"
+                  rows="1"
+                />
+                <button 
+                  onClick={askQuestion}
+                  disabled={!inputQuery.trim() || isThinking}
+                  className="absolute right-2.5 top-2.5 md:right-3 md:top-3 p-2 md:p-2.5 bg-[#10a37f] text-white rounded-xl hover:opacity-90 disabled:opacity-20 transition-all active:scale-90 shadow-md"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 10l7-7m0 0l7 7m-7-7v18" /></svg>
+                </button>
+              </div>
+              <div className="max-w-3xl mx-auto mt-3 hidden md:flex items-center justify-between px-2">
+                <p className="text-[10px] text-slate-400 font-medium uppercase tracking-widest">
+                  Grounded in global memory
+                </p>
+                <div className="flex items-center gap-4">
+                   <button onClick={() => setInputQuery("Search my transcripts...")} className="text-[10px] font-bold text-slate-400 hover:text-[#10a37f] transition-colors uppercase tracking-widest">Search</button>
+                   <button onClick={() => setInputQuery("Generate summary...")} className="text-[10px] font-bold text-slate-400 hover:text-[#10a37f] transition-colors uppercase tracking-widest">Summarize</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    )
+  }
+
   if (currentScreen === SCREENS.RECORD) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-red-50 to-pink-100 dark:from-gray-900 dark:to-gray-800 flex flex-col">
-        
-        <div className="p-4 flex items-center justify-between">
-          <button
-            onClick={() => {
-              if (isRecording) stopRecording()
-              setCurrentScreen(SCREENS.HOME)
-            }}
-            className="p-2 text-gray-700 dark:text-gray-300"
-          >
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
+      <div className="h-screen flex bg-[#0d0d0d] text-white overflow-hidden">
+        <main className="flex-1 flex flex-col items-center justify-center p-6 relative">
+          <button onClick={cancelRecording} className="absolute top-8 left-8 p-3 hover:bg-white/10 rounded-2xl transition-all active:scale-90">
+            <svg className="w-6 h-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
           </button>
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
-            {isRecording ? 'Recording' : 'Ready to Record'}
-          </h2>
-          <div className="w-6"></div>
-        </div>
-
-        <div className="flex-1 flex flex-col items-center justify-center px-4 pb-20">
           
-          <div className={`mb-12 text-6xl ${isRecording ? 'animate-pulse' : ''}`}>
-            {isRecording ? '🔴' : '🎙️'}
+          <div className="text-center mb-16">
+            <span className="text-[10px] font-bold text-[#10a37f] uppercase tracking-[0.3em] mb-4 block">Capturing Voice</span>
+            <h2 className="text-2xl font-bold tracking-tight">Audio Intake Studio</h2>
           </div>
 
-          {isRecording && (
-            <div className="mb-8">
-              <div className="text-5xl font-mono font-bold text-gray-900 dark:text-white">
-                {formatTime(recordingTime)}
-              </div>
-            </div>
-          )}
-
-          <button
-            onClick={isRecording ? stopRecording : startRecording}
-            className={`w-24 h-24 rounded-full shadow-2xl transition-all ${
-              isRecording
-                ? 'bg-red-600 hover:bg-red-700 active:scale-95'
-                : 'bg-blue-600 hover:bg-blue-700 active:scale-95'
-            }`}
-          >
-            {isRecording ? (
-              <svg className="w-12 h-12 mx-auto text-white" fill="currentColor" viewBox="0 0 24 24">
-                <rect x="6" y="6" width="12" height="12" rx="2"/>
-              </svg>
-            ) : (
-              <svg className="w-12 h-12 mx-auto text-white" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
-                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
-              </svg>
-            )}
-          </button>
-
-          <p className="mt-6 text-gray-600 dark:text-gray-400 text-sm">
-            {isRecording ? 'Tap to stop' : 'Tap to start recording'}
-          </p>
-        </div>
-
-        {errorMessage && (
-          <div className="fixed bottom-4 left-4 right-4 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl">
-            <p className="text-sm text-red-800 dark:text-red-300">{errorMessage}</p>
+          <div className="flex items-center gap-2 mb-12 h-20">
+            {[...Array(32)].map((_, i) => (
+              <div key={i} className={`wave-bar ${isRecording ? '' : 'opacity-20 animate-none !h-1'}`}></div>
+            ))}
           </div>
-        )}
+
+          <div className="text-8xl font-light mb-16 tabular-nums tracking-tighter text-white animate-pulse">
+            {formatTime(recordingTime)}
+          </div>
+
+          <div className="flex flex-col items-center gap-8">
+            <button 
+              onClick={isRecording ? stopRecording : startRecording}
+              className={`w-24 h-24 rounded-[2.5rem] flex items-center justify-center transition-all shadow-2xl active:scale-95 ${isRecording ? 'bg-red-500 hover:bg-red-600' : 'bg-[#10a37f] hover:bg-[#1a7f64] shadow-[#10a37f]/20'}`}
+            >
+              {isRecording ? (
+                <div className="w-8 h-8 bg-white rounded-lg"></div>
+              ) : (
+                <svg className="w-10 h-10 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+              )}
+            </button>
+            <p className="text-slate-400 text-sm font-bold tracking-widest uppercase">{isRecording ? 'Recording Live...' : 'Tap to Start Studio'}</p>
+          </div>
+        </main>
       </div>
     )
   }
 
-  // UPLOAD SCREEN
   if (currentScreen === SCREENS.UPLOAD) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800 flex flex-col">
-        
-        <div className="p-4 flex items-center justify-between">
-          <button
-            onClick={() => {
-              setSelectedFile(null)
-              setCurrentScreen(SCREENS.HOME)
-            }}
-            className="p-2 text-gray-700 dark:text-gray-300"
-          >
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-            </svg>
-          </button>
-          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Review Audio</h2>
-          <div className="w-6"></div>
-        </div>
-
-        <div className="flex-1 flex flex-col items-center justify-center px-4 pb-20">
+      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
+        <Sidebar />
+        <main className="flex-1 flex flex-col relative overflow-hidden">
+          <header className="h-16 md:h-20 flex items-center px-6 md:px-8 border-b border-transparent">
+            <button onClick={() => setCurrentScreen(SCREENS.MAIN)} className="p-2.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded-xl text-slate-500 active:scale-90 transition-transform">
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>
+            </button>
+          </header>
           
-          {selectedFile && (
-            <div className="w-full max-w-md space-y-6">
-              
-              <div className="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-lg">
-                <div className="text-center mb-4">
-                  <div className="text-5xl mb-3">🎵</div>
-                  <h3 className="font-semibold text-gray-900 dark:text-white text-lg truncate">
-                    {selectedFile.name}
-                  </h3>
-                  <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-                    {(selectedFile.size / 1024 / 1024).toFixed(2)} MB
-                  </p>
-                </div>
-
-                {selectedFile.type.startsWith('audio/') && (
-                  <audio
-                    src={URL.createObjectURL(selectedFile)}
-                    controls
-                    className="w-full mt-4"
-                  />
-                )}
+          <div className="flex-1 flex items-center justify-center p-6 animate-fade-in">
+            <div className="w-full max-w-md bg-[#f9f9f9] dark:bg-[#171717] p-10 rounded-[2.5rem] border border-slate-200 dark:border-white/10 shadow-2xl text-center">
+              <div className="w-20 h-20 bg-[#10a37f]/10 text-[#10a37f] rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-inner">
+                <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" /></svg>
               </div>
-
-              <button
-                onClick={uploadAndProcess}
-                className="w-full py-5 px-6 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-semibold rounded-2xl transition-colors shadow-lg text-lg"
-              >
-                Continue
-              </button>
-
-              <button
-                onClick={() => {
-                  setSelectedFile(null)
-                  setCurrentScreen(SCREENS.HOME)
-                }}
-                className="w-full py-3 text-gray-600 dark:text-gray-400 text-sm"
-              >
-                Choose different file
-              </button>
+              <h3 className="text-xl font-bold mb-2 truncate px-4 dark:text-white">{selectedFile?.name}</h3>
+              <p className="text-xs text-slate-500 font-bold uppercase tracking-widest mb-10">{(selectedFile?.size / 1024 / 1024).toFixed(2)} MB • Audio Ready</p>
+              
+              <div className="space-y-3">
+                <button 
+                  onClick={uploadAndProcess} 
+                  className="w-full py-4 bg-[#10a37f] hover:bg-[#1a7f64] text-white font-bold rounded-2xl transition-all shadow-lg shadow-[#10a37f]/20 active:scale-[0.98]"
+                >
+                  Start Global Indexing
+                </button>
+                <button 
+                  onClick={() => setCurrentScreen(SCREENS.MAIN)} 
+                  className="w-full py-4 bg-white dark:bg-[#212121] text-slate-500 dark:text-white/60 font-bold rounded-2xl border border-slate-200 dark:border-white/10 hover:bg-slate-50 transition-all active:scale-[0.98]"
+                >
+                  Discard File
+                </button>
+              </div>
             </div>
-          )}
-        </div>
-
-        {errorMessage && (
-          <div className="fixed bottom-4 left-4 right-4 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl">
-            <p className="text-sm text-red-800 dark:text-red-300">{errorMessage}</p>
           </div>
-        )}
+        </main>
       </div>
     )
   }
 
-  // PROCESSING SCREEN
   if (currentScreen === SCREENS.PROCESSING) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800 flex items-center justify-center px-4">
-        <div className="w-full max-w-md">
-          
-          <div className="bg-white dark:bg-gray-800 rounded-2xl p-8 shadow-lg text-center space-y-6">
-            
-            {processStatus === PROCESS_STATUS.PREPARING && (
-              <>
-                <div className="text-5xl animate-bounce">📦</div>
-                <h3 className="text-xl font-semibold text-gray-900 dark:text-white">
-                  Preparing upload...
-                </h3>
-              </>
-            )}
-
-            {processStatus === PROCESS_STATUS.UPLOADING && (
-              <>
-                <div className="text-5xl">☁️</div>
-                <h3 className="text-xl font-semibold text-gray-900 dark:text-white">
-                  Uploading your audio
-                </h3>
-                <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-3">
-                  <div
-                    className="bg-blue-600 h-3 rounded-full transition-all duration-300"
-                    style={{ width: `${uploadProgress}%` }}
-                  />
-                </div>
-                <p className="text-2xl font-mono font-bold text-gray-900 dark:text-white">
-                  {uploadProgress}%
-                </p>
-              </>
-            )}
-
-            {processStatus === PROCESS_STATUS.PROCESSING && (
-              <>
-                <div className="text-5xl animate-pulse">🎯</div>
-                <h3 className="text-xl font-semibold text-gray-900 dark:text-white">
-                  Your audio is being transcribed
-                </h3>
-                <p className="text-sm text-gray-600 dark:text-gray-400">
-                  This usually takes a moment. Feel free to wait or come back later.
-                </p>
-              </>
-            )}
-
-            {processStatus === PROCESS_STATUS.READY && (
-              <>
-                <div className="text-5xl">✅</div>
-                <h3 className="text-xl font-semibold text-gray-900 dark:text-white">
-                  Ready!
-                </h3>
-                <p className="text-sm text-gray-600 dark:text-gray-400">
-                  {chunksIndexed} segments indexed
-                </p>
-              </>
-            )}
-
-            {processStatus === PROCESS_STATUS.FAILED && (
-              <>
-                <div className="text-5xl">❌</div>
-                <h3 className="text-xl font-semibold text-gray-900 dark:text-white">
-                  Something went wrong
-                </h3>
-                <p className="text-sm text-gray-600 dark:text-gray-400">
-                  {errorMessage || 'Please try again'}
-                </p>
-                <button
-                  onClick={resetApp}
-                  className="w-full py-3 px-6 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl transition-colors"
-                >
-                  Start Over
-                </button>
-              </>
-            )}
-          </div>
-
-          {processStatus === PROCESS_STATUS.PROCESSING && (
-            <button
-              onClick={resetApp}
-              className="w-full mt-4 py-3 text-gray-600 dark:text-gray-400 text-sm"
-            >
-              Cancel and start over
-            </button>
-          )}
-        </div>
-      </div>
-    )
-  }
-
-  // CHAT SCREEN
-  if (currentScreen === SCREENS.CHAT) {
-    return (
-      <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex flex-col">
-        
-        {/* Header */}
-        <div className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-4 py-3 flex items-center justify-between sticky top-0 z-10">
-          <div className="flex items-center gap-3">
-            <button
-              onClick={resetApp}
-              className="p-2 text-gray-700 dark:text-gray-300"
-            >
-              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-              </svg>
-            </button>
-            <div>
-              <h2 className="text-base font-semibold text-gray-900 dark:text-white">
-                Ask Questions
-              </h2>
-              <p className="text-xs text-gray-500 dark:text-gray-400">
-                {chunksIndexed} segments ready
-              </p>
+      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden">
+        <div className="text-center max-w-xs animate-fade-in">
+          <div className="relative w-24 h-24 mx-auto mb-10">
+            <div className="absolute inset-0 border-4 border-[#10a37f]/10 rounded-[2rem]"></div>
+            <div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-[2rem] animate-spin"></div>
+            <div className="absolute inset-0 flex items-center justify-center">
+               <svg className="w-8 h-8 text-[#10a37f] animate-pulse" fill="currentColor" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
             </div>
           </div>
-        </div>
-
-        {/* Messages */}
-        <div className="flex-1 overflow-y-auto px-4 py-6 space-y-4">
-          
-          {messages.length === 0 && (
-            <div className="text-center py-12">
-              <div className="text-5xl mb-4">💬</div>
-              <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-2">
-                Your audio is ready
-              </h3>
-              <p className="text-sm text-gray-600 dark:text-gray-400">
-                Ask any question about what was said
-              </p>
-            </div>
-          )}
-
-          {messages.map((msg, idx) => (
-            <div
-              key={idx}
-              className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-            >
-              <div
-                className={`max-w-[85%] md:max-w-[70%] rounded-2xl px-4 py-3 ${
-                  msg.role === 'user'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-white dark:bg-gray-800 text-gray-900 dark:text-white border border-gray-200 dark:border-gray-700'
-                }`}
-              >
-                <p className="text-sm md:text-base whitespace-pre-wrap break-words">
-                  {msg.content}
-                </p>
-              </div>
-            </div>
-          ))}
-
-          {isThinking && (
-            <div className="flex justify-start">
-              <div className="max-w-[85%] md:max-w-[70%] bg-white dark:bg-gray-800 text-gray-900 dark:text-white border border-gray-200 dark:border-gray-700 rounded-2xl px-4 py-3">
-                <div className="flex gap-1">
-                  <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
-                  <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
-                  <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Error bar */}
-        {errorMessage && (
-          <div className="px-4 pb-2">
-            <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl">
-              <p className="text-xs text-red-800 dark:text-red-300">{errorMessage}</p>
-            </div>
-          </div>
-        )}
-
-        {/* Input */}
-        <div className="bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 px-4 py-3 sticky bottom-0">
-          <div className="flex gap-2 items-end">
-            <textarea
-              value={inputQuery}
-              onChange={(e) => setInputQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  askQuestion()
-                }
-              }}
-              placeholder="Ask a question..."
-              className="flex-1 px-4 py-3 border border-gray-300 dark:border-gray-600 rounded-2xl bg-gray-50 dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none text-sm md:text-base"
-              rows="1"
-              style={{ maxHeight: '120px' }}
-            />
-            <button
-              onClick={askQuestion}
-              disabled={!inputQuery.trim() || isThinking}
-              className="p-3 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white rounded-2xl transition-colors flex-shrink-0"
-            >
-              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
-              </svg>
-            </button>
+          <h2 className="text-2xl font-bold mb-3 tracking-tight dark:text-white">Expanding Intelligence</h2>
+          <p className="text-xs text-slate-500 font-bold uppercase tracking-[0.2em] mb-8">
+            {processStatus === PROCESS_STATUS.UPLOADING && 'Uploading to cloud...'}
+            {processStatus === PROCESS_STATUS.TRANSCRIBING && 'Analyzing voice patterns...'}
+            {processStatus === PROCESS_STATUS.INDEXING && 'Grounding global memory...'}
+            {processStatus === PROCESS_STATUS.READY && 'Ready!'}
+          </p>
+          <div className="w-full bg-slate-100 dark:bg-white/5 h-1.5 rounded-full overflow-hidden">
+             <div className="h-full bg-[#10a37f] transition-all duration-500" style={{ width: processStatus === PROCESS_STATUS.UPLOADING ? '30%' : processStatus === PROCESS_STATUS.TRANSCRIBING ? '60%' : '90%' }}></div>
           </div>
         </div>
       </div>
