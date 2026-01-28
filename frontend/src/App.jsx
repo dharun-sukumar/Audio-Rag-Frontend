@@ -34,7 +34,7 @@ function App() {
   const [recordingTime, setRecordingTime] = useState(0)
   const [savedRecordingDuration, setSavedRecordingDuration] = useState(0)
   const [activeTab, setActiveTab] = useState('chat') 
-  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
   const [library, setLibrary] = useState([])
   const [recordingName, setRecordingName] = useState('') // Name for current session
   
@@ -52,10 +52,30 @@ function App() {
   const recordingTimerRef = useRef(null)
   const fileInputRef = useRef(null)
   const chatEndRef = useRef(null)
+  const audioPlayerRef = useRef(null)
+
+  // Audio playback state
+  const [audioUrl, setAudioUrl] = useState(null)
+  const [isPlaying, setIsPlaying] = useState(false)
+
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isThinking])
+
+  // Create/cleanup audio URL when file is selected
+  useEffect(() => {
+    if (selectedFile) {
+      const url = URL.createObjectURL(selectedFile)
+      setAudioUrl(url)
+      setIsPlaying(false)
+      return () => {
+        URL.revokeObjectURL(url)
+        setAudioUrl(null)
+      }
+    }
+  }, [selectedFile])
+
 
   useEffect(() => {
     if (isRecording) {
@@ -72,6 +92,21 @@ function App() {
     const secs = seconds % 60
     return `${mins}:${secs.toString().padStart(2, '0')}`
   }
+
+  // Toggle audio playback
+  const togglePlayback = () => {
+    const audio = audioPlayerRef.current
+    if (!audio) return
+    
+    if (isPlaying) {
+      audio.pause()
+      setIsPlaying(false)
+    } else {
+      audio.play()
+      setIsPlaying(true)
+    }
+  }
+
 
   // --- ACTIONS ---
 
@@ -243,82 +278,97 @@ function App() {
       {/* Mobile Backdrop */}
       {sidebarOpen && (
         <div 
-          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[60] md:hidden"
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[60] lg:hidden"
           onClick={() => setSidebarOpen(false)}
         />
       )}
       
+      {/* Sidebar - Fixed on desktop, drawer on mobile */}
       <aside className={`
-        fixed md:relative top-0 left-0 bottom-0 
-        ${sidebarOpen ? 'w-72' : 'w-0 -translate-x-full md:translate-x-0 md:w-0'} 
+        fixed lg:sticky top-0 left-0 h-screen
+        ${sidebarOpen ? 'w-72 translate-x-0' : 'w-72 -translate-x-full lg:w-20 lg:translate-x-0'} 
         bg-[#f9f9f9] dark:bg-[#171717] border-r border-slate-200 dark:border-white/10 
-        transition-all duration-300 ease-in-out z-[70] overflow-hidden flex flex-col
+        transition-all duration-300 ease-out z-[70] flex flex-col flex-shrink-0
       `}>
-        <div className="p-6 flex flex-col h-full min-w-[288px]">
-          <div className="flex items-center justify-between mb-10 px-1">
-            <div className="flex items-center gap-3">
-              <div className="w-9 h-9 bg-[#10a37f] rounded-xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/20">
+        <div className="p-4 lg:p-3 flex flex-col h-full overflow-hidden">
+          {/* Header */}
+          <div className={`flex items-center ${sidebarOpen ? 'justify-between' : 'lg:justify-center'} mb-6 px-2`}>
+            <div className={`flex items-center gap-3 ${!sidebarOpen && 'lg:hidden'}`}>
+              <div className="w-10 h-10 bg-[#10a37f] rounded-xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/20 flex-shrink-0">
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
               </div>
-              <span className="font-bold text-xl tracking-tight dark:text-white">VoiceMemory</span>
+              <span className="font-bold text-lg tracking-tight dark:text-white">VoiceMemory</span>
             </div>
-            <button onClick={() => setSidebarOpen(false)} className="md:hidden p-2 hover:bg-slate-200 dark:hover:bg-white/5 rounded-lg transition-colors">
+            {/* Collapsed Logo */}
+            <div className={`hidden ${!sidebarOpen && 'lg:flex'} items-center justify-center`}>
+              <div className="w-10 h-10 bg-[#10a37f] rounded-xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/20">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" /></svg>
+              </div>
+            </div>
+            <button onClick={() => setSidebarOpen(false)} className="lg:hidden p-2 hover:bg-slate-200 dark:hover:bg-white/10 rounded-lg transition-colors">
               <svg className="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
             </button>
           </div>
 
-          <div className="space-y-3 mb-10">
+          {/* Actions */}
+          <div className="space-y-2 mb-6">
             <button 
-              onClick={() => { setMessages([]); if(window.innerWidth < 768) setSidebarOpen(false); }}
-              className="w-full flex items-center gap-3 px-4 py-3 bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-2xl hover:bg-slate-50 dark:hover:bg-white/10 transition-all text-sm font-bold active:scale-[0.98] mb-6"
+              onClick={() => { setMessages([]); if(window.innerWidth < 1024) setSidebarOpen(false); }}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-slate-50 dark:hover:bg-white/10 transition-all text-sm font-semibold active:scale-[0.98] ${!sidebarOpen && 'lg:justify-center lg:px-0'}`}
+              title="New Chat"
             >
-              <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
-              New Chat Thread
+              <svg className="w-5 h-5 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+              <span className={`${!sidebarOpen && 'lg:hidden'}`}>New Chat</span>
             </button>
 
             <button 
-              onClick={() => { setCurrentScreen(SCREENS.RECORD); if(window.innerWidth < 768) setSidebarOpen(false); }}
-              className="w-full flex items-center gap-3 px-4 py-3.5 bg-[#10a37f] text-white rounded-2xl hover:bg-[#1a7f64] transition-all text-sm font-bold shadow-md active:scale-[0.98]"
+              onClick={() => { setCurrentScreen(SCREENS.RECORD); if(window.innerWidth < 1024) setSidebarOpen(false); }}
+              className={`w-full flex items-center gap-3 px-3 py-3 bg-[#10a37f] text-white rounded-xl hover:bg-[#1a7f64] transition-all text-sm font-semibold shadow-md active:scale-[0.98] ${!sidebarOpen && 'lg:justify-center lg:px-0'}`}
+              title="Record Audio"
             >
-              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
-              Record New Audio
+              <svg className="w-5 h-5 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+              <span className={`${!sidebarOpen && 'lg:hidden'}`}>Record</span>
             </button>
             
             <button 
-              onClick={() => { fileInputRef.current.click(); if(window.innerWidth < 768) setSidebarOpen(false); }}
-              className="w-full flex items-center gap-3 px-4 py-3.5 bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-2xl hover:bg-slate-50 dark:hover:bg-white/10 transition-all text-sm font-bold active:scale-[0.98]"
+              onClick={() => { fileInputRef.current.click(); if(window.innerWidth < 1024) setSidebarOpen(false); }}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-slate-50 dark:hover:bg-white/10 transition-all text-sm font-semibold active:scale-[0.98] ${!sidebarOpen && 'lg:justify-center lg:px-0'}`}
+              title="Upload File"
             >
-              <svg className="w-5 h-5 text-[#10a37f]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
-              Upload Audio File
+              <svg className="w-5 h-5 text-[#10a37f] flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
+              <span className={`${!sidebarOpen && 'lg:hidden'}`}>Upload</span>
             </button>
             <input ref={fileInputRef} type="file" accept="audio/*" onChange={handleFileSelect} className="hidden" />
           </div>
           
-          <div className="flex-1 overflow-y-auto pr-2 custom-scrollbar">
-            <div className="p-5 rounded-3xl bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 shadow-sm relative overflow-hidden group">
-              <div className="absolute top-0 right-0 p-3 opacity-10 group-hover:scale-110 transition-transform">
-                <svg className="w-12 h-12 text-[#10a37f]" fill="currentColor" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-              </div>
-              <p className="text-[10px] font-bold text-[#10a37f] uppercase tracking-[0.2em] mb-3">System Status</p>
-              <h4 className="text-sm font-bold mb-2 dark:text-white">Unified Knowledge Base</h4>
-              <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed italic">
-                Your recordings are indexed into a global memory. AI responses are cross-referenced across all content.
+          {/* Status Card - Hidden when collapsed */}
+          <div className={`flex-1 overflow-y-auto custom-scrollbar ${!sidebarOpen && 'lg:hidden'}`}>
+            <div className="p-4 rounded-2xl bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 shadow-sm relative overflow-hidden">
+              <p className="text-[10px] font-bold text-[#10a37f] uppercase tracking-widest mb-2">Status</p>
+              <h4 className="text-sm font-bold mb-1 dark:text-white">Global Memory</h4>
+              <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+                AI answers grounded in all recordings.
               </p>
-              <div className="mt-4 flex items-center gap-2">
+              <div className="mt-3 flex items-center gap-2">
                 <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Active & Ready</span>
+                <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Active</span>
               </div>
             </div>
           </div>
 
-          <div className="mt-auto pt-6 border-t border-slate-200 dark:border-white/10">
-            <div className="flex items-center gap-3 px-2 py-3 rounded-2xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors cursor-pointer group">
-              <div className="w-10 h-10 rounded-full bg-indigo-500 flex items-center justify-center text-xs text-white font-bold border-2 border-white dark:border-white/10 shadow-sm group-hover:scale-105 transition-transform">JD</div>
-              <div className="flex-1 truncate">
-                <span className="block text-sm font-bold dark:text-white">John Doe</span>
-                <span className="text-[10px] text-[#10a37f] font-bold uppercase tracking-tighter">Pro Plan</span>
+          {/* Collapsed Status Indicator */}
+          <div className={`hidden ${!sidebarOpen && 'lg:flex'} flex-1 items-start justify-center pt-4`}>
+            <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse" title="System Active"></div>
+          </div>
+
+          {/* User Profile */}
+          <div className={`mt-auto pt-4 border-t border-slate-200 dark:border-white/10 ${!sidebarOpen && 'lg:border-0'}`}>
+            <div className={`flex items-center gap-3 p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors cursor-pointer ${!sidebarOpen && 'lg:justify-center'}`}>
+              <div className="w-9 h-9 rounded-full bg-indigo-500 flex items-center justify-center text-xs text-white font-bold flex-shrink-0">JD</div>
+              <div className={`flex-1 min-w-0 ${!sidebarOpen && 'lg:hidden'}`}>
+                <span className="block text-sm font-semibold dark:text-white truncate">John Doe</span>
+                <span className="text-[10px] text-[#10a37f] font-semibold">Pro Plan</span>
               </div>
-              <svg className="w-4 h-4 text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
             </div>
           </div>
         </div>
@@ -327,50 +377,71 @@ function App() {
   )
 
   const MainHeader = () => (
-    <header className="h-16 md:h-20 border-b border-slate-200 dark:border-white/10 px-4 md:px-8 flex items-center justify-between sticky top-0 z-50 glass-header">
-      <div className="flex items-center gap-4 md:gap-6">
+    <header className="h-14 lg:h-16 border-b border-slate-200 dark:border-white/10 px-4 lg:px-6 flex items-center justify-between bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl sticky top-0 z-40">
+      <div className="flex items-center gap-3">
+        {/* Sidebar Toggle */}
         <button 
           onClick={() => setSidebarOpen(!sidebarOpen)}
-          className="p-2.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded-xl transition-all text-slate-500 active:scale-95"
+          className="p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors text-slate-500"
+          title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
         >
-          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
+          {sidebarOpen ? (
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7m8 14l-7-7 7-7" /></svg>
+          ) : (
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
+          )}
         </button>
-        <div className="h-6 w-[1px] bg-slate-200 dark:bg-white/10 hidden md:block" />
-        <div>
-          <h2 className="text-sm font-bold dark:text-white hidden md:block uppercase tracking-[0.15em] text-slate-400">Global AI Intelligence</h2>
-          <div className="md:hidden font-extrabold text-lg tracking-tight dark:text-white flex items-center gap-2">
-            <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-pulse"></div>
-            VoiceMemory
-          </div>
+        
+        <div className="hidden lg:flex items-center gap-3">
+          <div className="h-5 w-px bg-slate-200 dark:bg-white/10" />
+          <h1 className="text-sm font-semibold text-slate-600 dark:text-slate-300">AI Assistant</h1>
+        </div>
+        
+        {/* Mobile Brand */}
+        <div className="lg:hidden flex items-center gap-2">
+          <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-pulse"></div>
+          <span className="font-bold text-base dark:text-white">VoiceMemory</span>
         </div>
       </div>
       
-      <div className="flex items-center gap-2 md:gap-4">
-        {/* Quick Intake Button for Mobile */}
-        <button 
-          onClick={() => setCurrentScreen(SCREENS.RECORD)}
-          className="md:hidden p-2.5 bg-[#10a37f]/10 text-[#10a37f] rounded-xl active:scale-90 transition-transform"
-        >
-          <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
-        </button>
-        
-        <div className="hidden md:flex items-center gap-2 px-4 py-2 bg-[#10a37f]/5 rounded-full border border-[#10a37f]/10 transition-all hover:bg-[#10a37f]/10 cursor-default group">
+      <div className="flex items-center gap-2 lg:gap-3">
+        {/* Status Badge - Desktop */}
+        <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-[#10a37f]/10 rounded-full">
           <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-pulse"></div>
-          <span className="text-[11px] font-bold text-[#10a37f] uppercase tracking-widest">Global Memory Active</span>
+          <span className="text-xs font-semibold text-[#10a37f]">Memory Active</span>
         </div>
         
-        <button className="p-2.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded-xl text-slate-500 transition-all active:scale-95">
-          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" /></svg>
+        {/* Quick Record - Mobile */}
+        <button 
+          onClick={() => setCurrentScreen(SCREENS.RECORD)}
+          className="lg:hidden p-2 bg-[#10a37f] text-white rounded-lg active:scale-95 transition-transform"
+        >
+          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+        </button>
+        
+        {/* Settings */}
+        <button className="p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg text-slate-400 transition-colors">
+          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
         </button>
       </div>
     </header>
   )
+
 
   // --- SCREENS ---
 
   if (currentScreen === SCREENS.REVIEW) {
     return (
       <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-end md:items-center justify-center relative overflow-hidden">
+        {/* Hidden Audio Element */}
+        {audioUrl && (
+          <audio 
+            ref={audioPlayerRef} 
+            src={audioUrl} 
+            onEnded={() => setIsPlaying(false)}
+          />
+        )}
+        
         {/* Immersive Background */}
         <div className="absolute inset-0 bg-[#10a37f]/5 pointer-events-none" />
         
@@ -403,8 +474,19 @@ function App() {
                   <p className="text-[10px] text-slate-500 font-bold uppercase">{formatTime(savedRecordingDuration)} Duration</p>
                 </div>
               </div>
-              <button className="p-2 text-[#10a37f] hover:bg-[#10a37f]/10 rounded-lg transition-colors">
-                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+              <button 
+                onClick={togglePlayback}
+                className="p-3 text-white bg-[#10a37f] hover:bg-[#1a7f64] rounded-xl transition-colors active:scale-95"
+              >
+                {isPlaying ? (
+                  <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/>
+                  </svg>
+                ) : (
+                  <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M8 5v14l11-7z"/>
+                  </svg>
+                )}
               </button>
             </div>
 
@@ -416,7 +498,7 @@ function App() {
                 Transcribe & Index
               </button>
               <button 
-                onClick={() => { setSelectedFile(null); setSavedRecordingDuration(0); setCurrentScreen(SCREENS.MAIN); }}
+                onClick={() => { setSelectedFile(null); setSavedRecordingDuration(0); setIsPlaying(false); setCurrentScreen(SCREENS.MAIN); }}
                 className="w-full py-4 text-slate-500 dark:text-white/40 font-bold text-sm hover:text-red-500 transition-colors"
               >
                 Discard Recording
@@ -429,125 +511,123 @@ function App() {
   }
   if (currentScreen === SCREENS.MAIN) {
     return (
-      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden relative">
+      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
         <Sidebar />
-        <main className="flex-1 flex flex-col overflow-hidden relative">
+        
+        {/* Main Content */}
+        <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
           <MainHeader />
           
-          <div className="flex-1 flex flex-col bg-white dark:bg-[#0d0d0d] overflow-hidden relative">
-            <div className="flex-1 overflow-y-auto px-4 md:px-0 scroll-smooth custom-scrollbar">
-              <div className="max-w-3xl mx-auto py-10 md:py-16 space-y-12 animate-fade-in pb-32">
-                {messages.length === 0 && (
-                  <div className="text-center py-20 px-6 max-w-xl mx-auto">
-                    <div className="w-24 h-24 bg-[#10a37f]/5 dark:bg-[#10a37f]/10 rounded-[2.5rem] flex items-center justify-center mx-auto mb-10 text-4xl shadow-inner border border-[#10a37f]/10 animate-bounce-subtle">🎙️</div>
-                    <h3 className="text-3xl font-bold mb-4 dark:text-white tracking-tight">How can I help you today?</h3>
-                    <p className="text-base text-slate-500 dark:text-slate-400 leading-relaxed max-w-md mx-auto">
-                      Ask me anything about your recorded conversations. I can summarize sessions, find specific details, or cross-reference facts.
-                    </p>
-                    
-                    <div className="mt-12 grid grid-cols-1 md:grid-cols-2 gap-3">
-                      <button onClick={() => setInputQuery("Summarize our last roadmap discussion")} className="p-4 text-sm font-semibold bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-2xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 transition-all text-left group shadow-sm active:scale-95">
-                        <span className="block text-[#10a37f] mb-1 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] uppercase tracking-widest font-bold">Example</span>
-                        "Summarize our last roadmap discussion"
-                      </button>
-                      <button onClick={() => setInputQuery("What were the action items for the marketing team?")} className="p-4 text-sm font-semibold bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-2xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 transition-all text-left group shadow-sm active:scale-95">
-                        <span className="block text-[#10a37f] mb-1 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] uppercase tracking-widest font-bold">Example</span>
-                        "What were the action items for the marketing team?"
-                      </button>
-                    </div>
+          {/* Chat Area */}
+          <div className="flex-1 overflow-y-auto px-4 lg:px-8 custom-scrollbar">
+            <div className="max-w-3xl mx-auto py-8 lg:py-12 pb-32 lg:pb-24">
+              {/* Empty State */}
+              {messages.length === 0 && (
+                <div className="text-center py-16 lg:py-24 px-4">
+                  <div className="w-20 h-20 lg:w-24 lg:h-24 bg-[#10a37f]/10 rounded-2xl lg:rounded-3xl flex items-center justify-center mx-auto mb-8 text-3xl lg:text-4xl">🎙️</div>
+                  <h3 className="text-2xl lg:text-3xl font-bold mb-3 dark:text-white">How can I help you today?</h3>
+                  <p className="text-sm lg:text-base text-slate-500 dark:text-slate-400 max-w-md mx-auto mb-10">
+                    Ask me anything about your recorded conversations. I can summarize, find details, or cross-reference facts.
+                  </p>
+                  
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 max-w-xl mx-auto">
+                    <button onClick={() => setInputQuery("Summarize our last roadmap discussion")} className="p-4 text-sm font-medium bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 transition-all text-left active:scale-[0.98]">
+                      "Summarize our last roadmap discussion"
+                    </button>
+                    <button onClick={() => setInputQuery("What were the action items for the marketing team?")} className="p-4 text-sm font-medium bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 transition-all text-left active:scale-[0.98]">
+                      "What were the action items?"
+                    </button>
                   </div>
-                )}
-                
+                </div>
+              )}
+              
+              {/* Messages */}
+              <div className="space-y-6">
                 {messages.map((msg, i) => (
-                  <div key={i} className={`flex gap-3 md:gap-8 ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in`}>
+                  <div key={i} className={`flex gap-3 lg:gap-4 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                     {msg.role === 'assistant' && (
-                      <div className="w-8 h-8 md:w-9 md:h-9 rounded-xl bg-[#10a37f] text-white flex items-center justify-center flex-shrink-0 mt-1 shadow-lg shadow-[#10a37f]/20">
-                        <svg className="w-4 h-4 md:w-5 md:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                      <div className="w-8 h-8 rounded-lg bg-[#10a37f] text-white flex items-center justify-center flex-shrink-0 mt-1">
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
                       </div>
                     )}
-                    <div className={`max-w-[88%] md:max-w-[85%] rounded-[1.5rem] md:rounded-3xl ${msg.role === 'user' ? 'bg-[#10a37f] text-white px-5 py-3 md:px-6 md:py-3.5 w-fit ml-auto rounded-tr-sm shadow-md' : 'bg-transparent text-slate-800 dark:text-white/95'}`}>
-                      <div className={`text-[15px] md:text-[16px] leading-[1.6] whitespace-pre-wrap ${msg.role === 'user' ? 'font-medium' : 'font-normal'}`}>
-                        {msg.content}
-                      </div>
+                    <div className={`max-w-[85%] lg:max-w-[75%] rounded-2xl ${msg.role === 'user' ? 'bg-[#10a37f] text-white px-4 py-2.5 rounded-br-sm' : 'text-slate-800 dark:text-white/90'}`}>
+                      <p className="text-[15px] leading-relaxed whitespace-pre-wrap">{msg.content}</p>
                       {msg.sources && msg.sources.length > 0 && (
-                        <div className="mt-6 flex flex-wrap gap-2 pt-5 border-t border-slate-200 dark:border-white/10">
+                        <div className="mt-4 flex flex-wrap gap-2 pt-3 border-t border-white/20">
                           {msg.sources.map(s => (
-                            <button key={s} className="text-[10px] font-bold text-[#10a37f] bg-[#10a37f]/10 px-3 py-1.5 rounded-full hover:bg-[#10a37f]/20 border border-[#10a37f]/20 transition-all uppercase tracking-[0.1em]">Ref: {s}</button>
+                            <span key={s} className="text-[10px] font-semibold bg-white/20 px-2 py-1 rounded">Ref: {s}</span>
                           ))}
                         </div>
                       )}
                     </div>
                     {msg.role === 'user' && (
-                      <div className="w-8 h-8 md:w-9 md:h-9 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center flex-shrink-0 text-[10px] font-bold mt-1 uppercase border border-slate-200 dark:border-white/10 dark:text-white shadow-sm hidden md:flex">JD</div>
+                      <div className="hidden lg:flex w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800 items-center justify-center flex-shrink-0 text-xs font-bold mt-1 dark:text-white">JD</div>
                     )}
                   </div>
                 ))}
                 
+                {/* Thinking */}
                 {isThinking && (
-                  <div className="flex gap-3 md:gap-8 animate-fade-in">
-                    <div className="w-8 h-8 md:w-9 md:h-9 rounded-xl bg-[#10a37f] text-white flex items-center justify-center flex-shrink-0 shadow-lg shadow-[#10a37f]/20">
-                       <svg className="w-4 h-4 md:w-5 md:h-5 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                  <div className="flex gap-3 lg:gap-4">
+                    <div className="w-8 h-8 rounded-lg bg-[#10a37f] text-white flex items-center justify-center flex-shrink-0">
+                      <svg className="w-4 h-4 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
                     </div>
-                    <div className="flex items-center gap-1.5 md:gap-2 mt-4">
-                      <div className="w-1.5 h-1.5 md:w-2 md:h-2 bg-slate-300 dark:bg-[#10a37f]/40 rounded-full animate-bounce"></div>
-                      <div className="w-1.5 h-1.5 md:w-2 md:h-2 bg-slate-300 dark:bg-[#10a37f]/40 rounded-full animate-bounce [animation-delay:0.2s]"></div>
-                      <div className="w-1.5 h-1.5 md:w-2 md:h-2 bg-slate-300 dark:bg-[#10a37f]/40 rounded-full animate-bounce [animation-delay:0.4s]"></div>
+                    <div className="flex items-center gap-1.5 py-3">
+                      <div className="w-2 h-2 bg-slate-300 dark:bg-slate-600 rounded-full animate-bounce"></div>
+                      <div className="w-2 h-2 bg-slate-300 dark:bg-slate-600 rounded-full animate-bounce [animation-delay:0.15s]"></div>
+                      <div className="w-2 h-2 bg-slate-300 dark:bg-slate-600 rounded-full animate-bounce [animation-delay:0.3s]"></div>
                     </div>
                   </div>
                 )}
-                <div ref={chatEndRef} />
               </div>
+              <div ref={chatEndRef} />
             </div>
+          </div>
 
-            {/* Mobile Bottom Bar (App Store Style) */}
-            <div className="md:hidden fixed bottom-0 left-0 right-0 bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl border-t border-slate-200 dark:border-white/10 px-6 py-3 flex justify-between items-center z-[100] pb-safe">
-              <button onClick={() => setSidebarOpen(true)} className="flex flex-col items-center gap-1 text-slate-400">
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
-                <span className="text-[9px] font-bold uppercase tracking-widest">Library</span>
-              </button>
-              <button 
-                onClick={() => setCurrentScreen(SCREENS.RECORD)}
-                className="w-14 h-14 bg-[#10a37f] rounded-2xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/30 -mt-8 border-4 border-white dark:border-[#0d0d0d] active:scale-90 transition-transform"
-              >
-                <svg className="w-7 h-7" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
-              </button>
-              <button onClick={() => setMessages([])} className="flex flex-col items-center gap-1 text-slate-400">
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
-                <span className="text-[9px] font-bold uppercase tracking-widest">New</span>
-              </button>
-            </div>
+          {/* Mobile Bottom Bar */}
+          <div className="lg:hidden fixed bottom-0 left-0 right-0 bg-white/90 dark:bg-[#0d0d0d]/90 backdrop-blur-xl border-t border-slate-200 dark:border-white/10 px-4 py-2 flex justify-around items-center z-50 pb-safe">
+            <button onClick={() => setSidebarOpen(true)} className="flex flex-col items-center gap-0.5 p-2 text-slate-400">
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
+              <span className="text-[9px] font-semibold uppercase">Menu</span>
+            </button>
+            <button 
+              onClick={() => setCurrentScreen(SCREENS.RECORD)}
+              className="w-14 h-14 bg-[#10a37f] rounded-2xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/30 -mt-6 active:scale-95 transition-transform"
+            >
+              <svg className="w-7 h-7" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
+            </button>
+            <button onClick={() => setMessages([])} className="flex flex-col items-center gap-0.5 p-2 text-slate-400">
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+              <span className="text-[9px] font-semibold uppercase">New</span>
+            </button>
+          </div>
 
-            {/* Chat Input Container */}
-            <div className="px-4 pb-20 md:pb-10 pt-2 bg-gradient-to-t from-white dark:from-[#0d0d0d] via-white dark:via-[#0d0d0d] to-transparent z-40">
-              <div className="max-w-3xl mx-auto relative group">
+          {/* Chat Input */}
+          <div className="px-4 lg:px-8 pb-20 lg:pb-6 pt-2 bg-gradient-to-t from-white dark:from-[#0d0d0d] via-white/95 dark:via-[#0d0d0d]/95 to-transparent">
+            <div className="max-w-3xl mx-auto">
+              <div className="relative">
                 <textarea 
                   value={inputQuery}
                   onChange={(e) => setInputQuery(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), askQuestion())}
                   placeholder="Ask about your audio..."
-                  className="w-full pl-6 pr-14 md:pr-16 py-4 md:py-5 bg-white dark:bg-[#171717] border border-slate-200 dark:border-white/10 rounded-[1.5rem] md:rounded-[2rem] shadow-2xl focus:ring-2 focus:ring-[#10a37f]/30 focus:border-[#10a37f]/50 transition-all resize-none text-[15px] placeholder-slate-400 dark:text-white leading-relaxed"
+                  className="w-full pl-4 pr-12 py-3.5 bg-white dark:bg-[#1a1a1a] border border-slate-200 dark:border-white/10 rounded-2xl shadow-lg focus:ring-2 focus:ring-[#10a37f]/30 focus:border-[#10a37f]/50 transition-all resize-none text-[15px] placeholder-slate-400 dark:text-white"
                   rows="1"
                 />
                 <button 
                   onClick={askQuestion}
                   disabled={!inputQuery.trim() || isThinking}
-                  className="absolute right-2.5 top-2.5 md:right-3 md:top-3 p-2 md:p-2.5 bg-[#10a37f] text-white rounded-xl hover:opacity-90 disabled:opacity-20 transition-all active:scale-90 shadow-md"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-[#10a37f] text-white rounded-xl disabled:opacity-30 transition-all active:scale-95"
                 >
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 10l7-7m0 0l7 7m-7-7v18" /></svg>
                 </button>
               </div>
-              <div className="max-w-3xl mx-auto mt-3 hidden md:flex items-center justify-between px-2">
-                <p className="text-[10px] text-slate-400 font-medium uppercase tracking-widest">
-                  Grounded in global memory
-                </p>
-                <div className="flex items-center gap-4">
-                   <button onClick={() => setInputQuery("Search my transcripts...")} className="text-[10px] font-bold text-slate-400 hover:text-[#10a37f] transition-colors uppercase tracking-widest">Search</button>
-                   <button onClick={() => setInputQuery("Generate summary...")} className="text-[10px] font-bold text-slate-400 hover:text-[#10a37f] transition-colors uppercase tracking-widest">Summarize</button>
-                </div>
-              </div>
+              <p className="hidden lg:block text-center text-xs text-slate-400 mt-3">
+                Responses are grounded in your audio transcripts
+              </p>
             </div>
           </div>
-        </main>
+        </div>
       </div>
     )
   }
@@ -597,38 +677,42 @@ function App() {
     return (
       <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
         <Sidebar />
-        <main className="flex-1 flex flex-col relative overflow-hidden">
-          <header className="h-16 md:h-20 flex items-center px-6 md:px-8 border-b border-transparent">
-            <button onClick={() => setCurrentScreen(SCREENS.MAIN)} className="p-2.5 hover:bg-slate-100 dark:hover:bg-white/5 rounded-xl text-slate-500 active:scale-90 transition-transform">
-              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>
+        
+        <div className="flex-1 flex flex-col min-w-0">
+          {/* Header */}
+          <header className="h-14 lg:h-16 flex items-center px-4 lg:px-6 border-b border-slate-200 dark:border-white/10 bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl">
+            <button onClick={() => setCurrentScreen(SCREENS.MAIN)} className="p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg text-slate-500 transition-colors">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
             </button>
+            <span className="ml-2 text-sm font-semibold text-slate-600 dark:text-slate-300">Upload Audio</span>
           </header>
           
-          <div className="flex-1 flex items-center justify-center p-6 animate-fade-in">
-            <div className="w-full max-w-md bg-[#f9f9f9] dark:bg-[#171717] p-10 rounded-[2.5rem] border border-slate-200 dark:border-white/10 shadow-2xl text-center">
-              <div className="w-20 h-20 bg-[#10a37f]/10 text-[#10a37f] rounded-3xl flex items-center justify-center mx-auto mb-8 shadow-inner">
-                <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" /></svg>
+          {/* Content */}
+          <div className="flex-1 flex items-center justify-center p-6">
+            <div className="w-full max-w-sm bg-white dark:bg-[#171717] p-8 rounded-2xl border border-slate-200 dark:border-white/10 shadow-xl text-center">
+              <div className="w-16 h-16 bg-[#10a37f]/10 text-[#10a37f] rounded-2xl flex items-center justify-center mx-auto mb-6">
+                <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" /></svg>
               </div>
-              <h3 className="text-xl font-bold mb-2 truncate px-4 dark:text-white">{selectedFile?.name}</h3>
-              <p className="text-xs text-slate-500 font-bold uppercase tracking-widest mb-10">{(selectedFile?.size / 1024 / 1024).toFixed(2)} MB • Audio Ready</p>
+              <h3 className="text-lg font-bold mb-1 dark:text-white truncate">{selectedFile?.name}</h3>
+              <p className="text-sm text-slate-500 mb-8">{(selectedFile?.size / 1024 / 1024).toFixed(2)} MB</p>
               
-              <div className="space-y-3">
+              <div className="space-y-2">
                 <button 
                   onClick={uploadAndProcess} 
-                  className="w-full py-4 bg-[#10a37f] hover:bg-[#1a7f64] text-white font-bold rounded-2xl transition-all shadow-lg shadow-[#10a37f]/20 active:scale-[0.98]"
+                  className="w-full py-3 bg-[#10a37f] text-white font-semibold rounded-xl transition-all active:scale-[0.98]"
                 >
-                  Start Global Indexing
+                  Process Audio
                 </button>
                 <button 
                   onClick={() => setCurrentScreen(SCREENS.MAIN)} 
-                  className="w-full py-4 bg-white dark:bg-[#212121] text-slate-500 dark:text-white/60 font-bold rounded-2xl border border-slate-200 dark:border-white/10 hover:bg-slate-50 transition-all active:scale-[0.98]"
+                  className="w-full py-3 text-slate-500 font-medium text-sm hover:text-slate-700 dark:hover:text-slate-300 transition-colors"
                 >
-                  Discard File
+                  Cancel
                 </button>
               </div>
             </div>
           </div>
-        </main>
+        </div>
       </div>
     )
   }
