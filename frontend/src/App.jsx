@@ -32,6 +32,7 @@ function App() {
   const [errorMessage, setErrorMessage] = useState('')
   const [isRecording, setIsRecording] = useState(false)
   const [recordingTime, setRecordingTime] = useState(0)
+  const [savedRecordingDuration, setSavedRecordingDuration] = useState(0)
   const [activeTab, setActiveTab] = useState('chat') 
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [library, setLibrary] = useState([])
@@ -130,6 +131,8 @@ function App() {
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      // Save the duration BEFORE stopping, because setIsRecording(false) will reset recordingTime
+      setSavedRecordingDuration(recordingTime)
       mediaRecorderRef.current.stop()
     }
     setIsRecording(false)
@@ -142,6 +145,7 @@ function App() {
       mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop())
     }
     setIsRecording(false)
+    setSavedRecordingDuration(0)
     setCurrentScreen(SCREENS.MAIN)
   }
 
@@ -216,8 +220,9 @@ function App() {
       
       if (!res.ok) throw new Error('Failed to get answer')
       
-      // Response is a string
-      const answer = await res.json()
+      // Response is {"answer": "..."}
+      const data = await res.json()
+      const answer = data.answer || data
       
       setMessages(prev => [...prev, { 
         role: 'assistant', 
@@ -395,7 +400,7 @@ function App() {
                 </div>
                 <div>
                   <p className="text-xs font-bold dark:text-white uppercase tracking-tighter">Audio Clip</p>
-                  <p className="text-[10px] text-slate-500 font-bold uppercase">{formatTime(recordingTime)} Duration</p>
+                  <p className="text-[10px] text-slate-500 font-bold uppercase">{formatTime(savedRecordingDuration)} Duration</p>
                 </div>
               </div>
               <button className="p-2 text-[#10a37f] hover:bg-[#10a37f]/10 rounded-lg transition-colors">
@@ -411,7 +416,7 @@ function App() {
                 Transcribe & Index
               </button>
               <button 
-                onClick={() => { setSelectedFile(null); setCurrentScreen(SCREENS.MAIN); }}
+                onClick={() => { setSelectedFile(null); setSavedRecordingDuration(0); setCurrentScreen(SCREENS.MAIN); }}
                 className="w-full py-4 text-slate-500 dark:text-white/40 font-bold text-sm hover:text-red-500 transition-colors"
               >
                 Discard Recording
