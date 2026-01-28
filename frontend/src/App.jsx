@@ -131,6 +131,13 @@ function App() {
 
   const startRecording = async () => {
     setErrorMessage('')
+    
+    // Check if getUserMedia is supported
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setErrorMessage('Your browser does not support audio recording. Please use Chrome, Firefox, or Safari.')
+      return
+    }
+    
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       
@@ -138,7 +145,7 @@ function App() {
       const types = ['audio/webm', 'audio/ogg', 'audio/mp4', 'audio/wav']
       const supportedType = types.find(type => MediaRecorder.isTypeSupported(type)) || ''
       
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: supportedType })
+      const mediaRecorder = new MediaRecorder(stream, supportedType ? { mimeType: supportedType } : {})
       mediaRecorderRef.current = mediaRecorder
       audioChunksRef.current = []
       
@@ -149,15 +156,16 @@ function App() {
       }
       
       mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: supportedType || 'audio/wav' })
-        const extension = supportedType.split('/')[1] || 'wav'
+        const mimeType = mediaRecorder.mimeType || 'audio/webm'
+        const audioBlob = new Blob(audioChunksRef.current, { type: mimeType })
+        const extension = mimeType.split('/')[1]?.split(';')[0] || 'webm'
         const file = new File([audioBlob], `recording_${Date.now()}.${extension}`, { 
-          type: supportedType || 'audio/wav' 
+          type: mimeType 
         })
         
         setSelectedFile(file)
         setRecordingName(`Recording ${new Date().toLocaleDateString()}`)
-        setCurrentScreen(SCREENS.REVIEW) // Move to Review Screen instead of auto-upload
+        setCurrentScreen(SCREENS.REVIEW)
         
         stream.getTracks().forEach(t => t.stop())
       }
@@ -166,11 +174,19 @@ function App() {
       mediaRecorder.start(1000)
       setIsRecording(true)
     } catch (err) {
-      console.error('Recording error:', err)
-      if (err.name === 'NotAllowedError') {
-        setErrorMessage('Microphone access was denied. Please check your browser permissions.')
+      console.error('Recording error:', err.name, err.message)
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setErrorMessage('Microphone access was denied. Please allow microphone access in your browser settings and try again.')
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        setErrorMessage('No microphone found. Please connect a microphone and try again.')
+      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+        setErrorMessage('Your microphone is busy or unavailable. Please close other apps using it.')
+      } else if (err.name === 'OverconstrainedError') {
+        setErrorMessage('Could not find a suitable microphone.')
+      } else if (err.name === 'SecurityError') {
+        setErrorMessage('Microphone access is blocked. Please ensure you are on HTTPS or localhost.')
       } else {
-        setErrorMessage('Could not start recording. Please check your microphone connection.')
+        setErrorMessage(`Recording failed: ${err.message || 'Unknown error'}. Please try again.`)
       }
     }
   }
@@ -443,7 +459,7 @@ function App() {
         {/* Share */}
         <button 
           onClick={copyUrl}
-          className={`p-2 rounded-lg transition-all relative ${copied ? 'bg-[#10a37f]/10 text-[#10a37f]' : 'hover:bg-slate-100 dark:hover:bg-white/10 text-slate-400'}`}
+          className={`p-2 rounded-lg transition-all ${copied ? 'bg-[#10a37f]/10 text-[#10a37f]' : 'hover:bg-slate-100 dark:hover:bg-white/10 text-slate-400'}`}
           title="Copy link"
         >
           {copied ? (
@@ -674,6 +690,19 @@ function App() {
             <h2 className="text-2xl font-bold tracking-tight">Audio Intake Studio</h2>
           </div>
 
+          {/* Error Message */}
+          {errorMessage && (
+            <div className="mb-8 px-6 py-4 bg-red-500/10 border border-red-500/20 rounded-2xl max-w-md text-center">
+              <p className="text-red-400 text-sm font-medium">{errorMessage}</p>
+              <button 
+                onClick={() => setErrorMessage('')} 
+                className="mt-2 text-xs text-red-400/70 hover:text-red-400 underline"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
           <div className="flex items-center gap-2 mb-12 h-20">
             {[...Array(32)].map((_, i) => (
               <div key={i} className={`wave-bar ${isRecording ? '' : 'opacity-20 animate-none !h-1'}`}></div>
@@ -695,7 +724,7 @@ function App() {
                 <svg className="w-10 h-10 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
               )}
             </button>
-            <p className="text-slate-400 text-sm font-bold tracking-widest uppercase">{isRecording ? 'Recording Live...' : 'Tap to Start Studio'}</p>
+            <p className="text-slate-400 text-sm font-bold tracking-widest uppercase">{isRecording ? 'Recording Live...' : 'Tap to Start'}</p>
           </div>
         </main>
       </div>
