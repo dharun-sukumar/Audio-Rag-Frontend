@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import './App.css'
+import { auth, googleProvider } from './firebase'
+import { signInWithPopup, signOut, onAuthStateChanged, getIdToken } from 'firebase/auth'
 
 const API_BASE_URL = 'http://139.59.19.169:8000'
 
@@ -10,6 +12,7 @@ const SCREENS = {
   REVIEW: 'review', // New Review Sheet
   WORKSPACE: 'workspace', // Transcript + Chat
   PROCESSING: 'processing',
+  LOGIN: 'login', // Login screen
 }
 
 const PROCESS_STATUS = {
@@ -37,6 +40,15 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [library, setLibrary] = useState([])
   const [recordingName, setRecordingName] = useState('') // Name for current session
+  
+  // Authentication state
+  const [user, setUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [showLoginModal, setShowLoginModal] = useState(false)
+  const [imageError, setImageError] = useState(new Set())
+  const [authToken, setAuthToken] = useState(null)
+  const [tokenCopied, setTokenCopied] = useState(false)
+  const [showFullToken, setShowFullToken] = useState(false)
   
   // Highlighting state for source verification
   const [highlightedTimestamp, setHighlightedTimestamp] = useState(null)
@@ -98,10 +110,126 @@ function App() {
     return () => clearInterval(recordingTimerRef.current)
   }, [isRecording])
 
+  // Auth state listener
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setUser(user)
+      setAuthLoading(false)
+      // Reset image error when user changes
+      setImageError(new Set())
+      // Close login modal if user signs in
+      if (user) {
+        setShowLoginModal(false)
+        // Fetch auth token
+        try {
+          const token = await getIdToken(user)
+          setAuthToken(token)
+        } catch (error) {
+          console.error('Error getting auth token:', error)
+          setAuthToken(null)
+        }
+        // Debug: Log user info to verify photoURL is available
+        console.log('User signed in:', {
+          displayName: user.displayName,
+          email: user.email,
+          photoURL: user.photoURL,
+          providerData: user.providerData
+        })
+      } else {
+        setAuthToken(null)
+      }
+    })
+
+    return () => unsubscribe()
+  }, [])
+
+  // Refresh token periodically (tokens expire after 1 hour)
+  useEffect(() => {
+    if (!user) return
+
+    const refreshToken = async () => {
+      try {
+        const token = await getIdToken(user, true) // Force refresh
+        setAuthToken(token)
+      } catch (error) {
+        console.error('Error refreshing auth token:', error)
+      }
+    }
+
+    // Refresh token every 50 minutes (tokens expire after 1 hour)
+    const interval = setInterval(refreshToken, 50 * 60 * 1000)
+    
+    return () => clearInterval(interval)
+  }, [user])
+
+  // Copy token to clipboard
+  const copyToken = async () => {
+    if (!authToken) return
+    try {
+      await navigator.clipboard.writeText(authToken)
+      setTokenCopied(true)
+      setTimeout(() => setTokenCopied(false), 2000)
+    } catch (err) {
+      console.error('Failed to copy token:', err)
+    }
+  }
+
   const formatTime = (seconds) => {
     const mins = Math.floor(seconds / 60)
     const secs = seconds % 60
     return `${mins}:${secs.toString().padStart(2, '0')}`
+  }
+
+  // Authentication functions
+  const handleGoogleSignIn = async () => {
+    try {
+      setErrorMessage('')
+      await signInWithPopup(auth, googleProvider)
+    } catch (error) {
+      console.error('Sign in error:', error)
+      if (error.code === 'auth/popup-closed-by-user') {
+        setErrorMessage('Sign in was cancelled.')
+      } else if (error.code === 'auth/popup-blocked') {
+        setErrorMessage('Popup was blocked. Please allow popups and try again.')
+      } else {
+        setErrorMessage(`Sign in failed: ${error.message}`)
+      }
+    }
+  }
+
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth)
+      setMessages([])
+    } catch (error) {
+      console.error('Sign out error:', error)
+      setErrorMessage('Failed to sign out.')
+    }
+  }
+
+  // Check if user needs to login for protected actions
+  const requireAuth = (action) => {
+    if (!user) {
+      setShowLoginModal(true)
+      return false
+    }
+    return true
+  }
+
+  // Get user initials for avatar
+  const getUserInitials = (user) => {
+    if (user?.displayName) {
+      return user.displayName
+        .split(' ')
+        .map(n => n[0])
+        .join('')
+        .toUpperCase()
+        .slice(0, 2)
+    }
+    if (user?.email) {
+      return user.email[0].toUpperCase()
+    }
+    return 'U'
   }
 
   // Toggle audio playback
@@ -124,6 +252,11 @@ function App() {
   const handleFileSelect = (e) => {
     const file = e.target.files[0]
     if (file && file.type.startsWith('audio/')) {
+      // Check authentication first
+      if (!requireAuth('upload')) {
+        e.target.value = '' // Reset file input
+        return
+      }
       setSelectedFile(file)
       setCurrentScreen(SCREENS.UPLOAD)
     }
@@ -131,6 +264,11 @@ function App() {
 
   const startRecording = async () => {
     setErrorMessage('')
+    
+    // Check authentication first
+    if (!requireAuth('record')) {
+      return
+    }
     
     // Check if getUserMedia is supported
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -359,7 +497,12 @@ function App() {
             </button>
 
             <button 
-              onClick={() => { setCurrentScreen(SCREENS.RECORD); if(window.innerWidth < 1024) setSidebarOpen(false); }}
+              onClick={() => { 
+                if (requireAuth('record')) {
+                  setCurrentScreen(SCREENS.RECORD)
+                  if(window.innerWidth < 1024) setSidebarOpen(false)
+                }
+              }}
               className={`w-full flex items-center gap-3 px-3 py-3 bg-[#10a37f] text-white rounded-xl hover:bg-[#1a7f64] transition-all text-sm font-semibold shadow-md active:scale-[0.98] ${!sidebarOpen && 'lg:justify-center lg:px-0'}`}
               title="Record Audio"
             >
@@ -368,7 +511,12 @@ function App() {
             </button>
             
             <button 
-              onClick={() => { fileInputRef.current.click(); if(window.innerWidth < 1024) setSidebarOpen(false); }}
+              onClick={() => { 
+                if (requireAuth('upload')) {
+                  fileInputRef.current.click()
+                  if(window.innerWidth < 1024) setSidebarOpen(false)
+                }
+              }}
               className={`w-full flex items-center gap-3 px-3 py-2.5 bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-slate-50 dark:hover:bg-white/10 transition-all text-sm font-semibold active:scale-[0.98] ${!sidebarOpen && 'lg:justify-center lg:px-0'}`}
               title="Upload File"
             >
@@ -400,13 +548,124 @@ function App() {
 
           {/* User Profile */}
           <div className={`mt-auto pt-4 border-t border-slate-200 dark:border-white/10 ${!sidebarOpen && 'lg:border-0'}`}>
-            <div className={`flex items-center gap-3 p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors cursor-pointer ${!sidebarOpen && 'lg:justify-center'}`}>
-              <div className="w-9 h-9 rounded-full bg-indigo-500 flex items-center justify-center text-xs text-white font-bold flex-shrink-0">JD</div>
-              <div className={`flex-1 min-w-0 ${!sidebarOpen && 'lg:hidden'}`}>
-                <span className="block text-sm font-semibold dark:text-white truncate">John Doe</span>
-                <span className="text-[10px] text-[#10a37f] font-semibold">Pro Plan</span>
+            {user ? (
+              <div className="space-y-2">
+                <div className={`flex items-center gap-3 p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors ${!sidebarOpen && 'lg:justify-center'}`}>
+                  {user.photoURL && !imageError.has('profile') ? (
+                    <img 
+                      src={user.photoURL} 
+                      alt={user.displayName || user.email || 'User'} 
+                      className="w-9 h-9 rounded-full flex-shrink-0 object-cover border-2 border-slate-200 dark:border-white/10"
+                      onError={(e) => {
+                        console.error('Profile image failed to load:', user.photoURL)
+                        setImageError(prev => new Set(prev).add('profile'))
+                      }}
+                      onLoad={() => {
+                        console.log('Profile image loaded successfully:', user.photoURL)
+                        setImageError(prev => {
+                          const newSet = new Set(prev)
+                          newSet.delete('profile')
+                          return newSet
+                        })
+                      }}
+                    />
+                  ) : (
+                    <div className="w-9 h-9 rounded-full bg-indigo-500 flex items-center justify-center text-xs text-white font-bold flex-shrink-0 border-2 border-slate-200 dark:border-white/10">
+                      {getUserInitials(user)}
+                    </div>
+                  )}
+                  <div className={`flex-1 min-w-0 ${!sidebarOpen && 'lg:hidden'}`}>
+                    <span className="block text-sm font-semibold dark:text-white truncate">
+                      {user.displayName || user.email || 'User'}
+                    </span>
+                    <span className="text-[10px] text-[#10a37f] font-semibold">Pro Plan</span>
+                  </div>
+                </div>
+                {sidebarOpen && (
+                  <>
+                    {/* Auth Token Section */}
+                    <div className="p-3 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10">
+                      <div className="flex items-center justify-between mb-2">
+                        <label className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">
+                          Auth Token
+                        </label>
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => setShowFullToken(!showFullToken)}
+                            className="p-1.5 hover:bg-slate-200 dark:hover:bg-white/10 rounded-lg transition-colors"
+                            title={showFullToken ? "Hide full token" : "Show full token"}
+                          >
+                            <svg className="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              {showFullToken ? (
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
+                              ) : (
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                              )}
+                            </svg>
+                          </button>
+                          <button
+                            onClick={copyToken}
+                            className="p-1.5 hover:bg-slate-200 dark:hover:bg-white/10 rounded-lg transition-colors"
+                            title="Copy token"
+                          >
+                            {tokenCopied ? (
+                              <svg className="w-3.5 h-3.5 text-[#10a37f]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                              </svg>
+                            ) : (
+                              <svg className="w-3.5 h-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                              </svg>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                      {authToken ? (
+                        <div className="relative">
+                          <code 
+                            className="block text-[10px] font-mono text-slate-600 dark:text-slate-300 break-all p-2 bg-white dark:bg-[#0d0d0d] rounded border border-slate-200 dark:border-white/10 cursor-pointer hover:bg-slate-50 dark:hover:bg-white/5 transition-colors max-h-32 overflow-y-auto"
+                            onClick={copyToken}
+                            title="Click to copy"
+                          >
+                            {showFullToken ? authToken : `${authToken.substring(0, 40)}...`}
+                          </code>
+                        </div>
+                      ) : (
+                        <div className="text-[10px] text-slate-400 dark:text-slate-500 italic p-2">
+                          Loading token...
+                        </div>
+                      )}
+                    </div>
+                    
+                    {/* Sign Out Button */}
+                    <button
+                      onClick={handleSignOut}
+                      className="w-full flex items-center gap-3 px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-xl transition-all"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                      </svg>
+                      <span>Sign Out</span>
+                    </button>
+                  </>
+                )}
               </div>
-            </div>
+            ) : (
+              <button
+                onClick={() => setShowLoginModal(true)}
+                className={`w-full flex items-center gap-3 p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors ${!sidebarOpen && 'lg:justify-center'}`}
+              >
+                <div className="w-9 h-9 rounded-full bg-slate-300 dark:bg-slate-700 flex items-center justify-center flex-shrink-0">
+                  <svg className="w-5 h-5 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                  </svg>
+                </div>
+                <div className={`flex-1 min-w-0 ${!sidebarOpen && 'lg:hidden'}`}>
+                  <span className="block text-sm font-semibold dark:text-white">Sign In</span>
+                  <span className="text-[10px] text-slate-500 dark:text-slate-400">Click to login</span>
+                </div>
+              </button>
+            )}
           </div>
         </div>
       </aside>
@@ -450,7 +709,11 @@ function App() {
         
         {/* Quick Record - Mobile */}
         <button 
-          onClick={() => setCurrentScreen(SCREENS.RECORD)}
+          onClick={() => {
+            if (requireAuth('record')) {
+              setCurrentScreen(SCREENS.RECORD)
+            }
+          }}
           className="lg:hidden p-2 bg-[#10a37f] text-white rounded-lg active:scale-95 transition-transform"
         >
           <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
@@ -475,9 +738,76 @@ function App() {
 
   // --- SCREENS ---
 
+  // Login Modal Component
+  const LoginModal = () => {
+    if (!showLoginModal) return null
+
+    return (
+      <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+        {/* Backdrop */}
+        <div 
+          className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+          onClick={() => setShowLoginModal(false)}
+        />
+        
+        {/* Modal */}
+        <div className="relative w-full max-w-md bg-white dark:bg-[#171717] rounded-2xl shadow-2xl border border-slate-200 dark:border-white/10 p-8 animate-fade-in">
+          {/* Close Button */}
+          <button
+            onClick={() => setShowLoginModal(false)}
+            className="absolute top-4 right-4 p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors text-slate-400"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+
+          {/* Logo */}
+          <div className="w-16 h-16 bg-gradient-to-br from-[#10a37f] to-[#0d8a6a] rounded-2xl flex items-center justify-center mx-auto mb-6 text-white shadow-lg shadow-[#10a37f]/30">
+            <svg className="w-8 h-8" viewBox="0 0 24 24" fill="none">
+              <path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+              <circle cx="8.5" cy="10.5" r="1.5" fill="currentColor"/>
+              <circle cx="12" cy="10.5" r="1.5" fill="currentColor"/>
+              <circle cx="15.5" cy="10.5" r="1.5" fill="currentColor"/>
+            </svg>
+          </div>
+
+          {/* Title */}
+          <h2 className="text-2xl font-bold mb-2 text-center dark:text-white">Sign In Required</h2>
+          <p className="text-sm text-slate-500 dark:text-slate-400 text-center mb-6">
+            Please sign in to record audio, upload files, and access your profile
+          </p>
+
+          {/* Error Message */}
+          {errorMessage && (
+            <div className="mb-4 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl">
+              <p className="text-red-500 text-sm font-medium text-center">{errorMessage}</p>
+            </div>
+          )}
+
+          {/* Sign In Button */}
+          <button
+            onClick={handleGoogleSignIn}
+            className="w-full flex items-center justify-center gap-3 px-6 py-4 bg-white dark:bg-[#1a1a1a] border-2 border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 dark:hover:bg-[#10a37f]/10 transition-all font-semibold shadow-lg active:scale-[0.98]"
+          >
+            <svg className="w-5 h-5" viewBox="0 0 24 24">
+              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+            </svg>
+            <span>Continue with Google</span>
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   if (currentScreen === SCREENS.REVIEW) {
     return (
-      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-end md:items-center justify-center relative overflow-hidden">
+      <>
+        <LoginModal />
+        <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-end md:items-center justify-center relative overflow-hidden">
         {/* Hidden Audio Element */}
         {audioUrl && (
           <audio 
@@ -552,15 +882,19 @@ function App() {
           </div>
         </div>
       </div>
+      </>
     )
   }
+  
   if (currentScreen === SCREENS.MAIN) {
     return (
-      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
-        <Sidebar />
+      <>
+        <LoginModal />
+        <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
+          <Sidebar />
         
-        {/* Main Content */}
-        <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
+          {/* Main Content */}
+          <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
           <MainHeader />
           
           {/* Chat Area */}
@@ -606,7 +940,28 @@ function App() {
                       )}
                     </div>
                     {msg.role === 'user' && (
-                      <div className="hidden lg:flex w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800 items-center justify-center flex-shrink-0 text-xs font-bold mt-1 dark:text-white">JD</div>
+                      <div className="hidden lg:flex w-8 h-8 rounded-full bg-slate-100 dark:bg-slate-800 items-center justify-center flex-shrink-0 text-xs font-bold mt-1 dark:text-white border border-slate-200 dark:border-white/10 overflow-hidden">
+                        {user?.photoURL && !imageError.has('chat') ? (
+                          <img 
+                            src={user.photoURL} 
+                            alt={user.displayName || user.email || 'User'} 
+                            className="w-full h-full rounded-full object-cover"
+                            onError={(e) => {
+                              console.error('Chat avatar image failed to load:', user.photoURL)
+                              setImageError(prev => new Set(prev).add('chat'))
+                            }}
+                            onLoad={() => {
+                              setImageError(prev => {
+                                const newSet = new Set(prev)
+                                newSet.delete('chat')
+                                return newSet
+                              })
+                            }}
+                          />
+                        ) : (
+                          getUserInitials(user)
+                        )}
+                      </div>
                     )}
                   </div>
                 ))}
@@ -636,7 +991,11 @@ function App() {
               <span className="text-[9px] font-semibold uppercase">Menu</span>
             </button>
             <button 
-              onClick={() => setCurrentScreen(SCREENS.RECORD)}
+              onClick={() => {
+                if (requireAuth('record')) {
+                  setCurrentScreen(SCREENS.RECORD)
+                }
+              }}
               className="w-14 h-14 bg-[#10a37f] rounded-2xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/30 -mt-6 active:scale-95 transition-transform"
             >
               <svg className="w-7 h-7" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
@@ -674,12 +1033,15 @@ function App() {
           </div>
         </div>
       </div>
+      </>
     )
   }
 
   if (currentScreen === SCREENS.RECORD) {
     return (
-      <div className="h-screen flex bg-[#0d0d0d] text-white overflow-hidden">
+      <>
+        <LoginModal />
+        <div className="h-screen flex bg-[#0d0d0d] text-white overflow-hidden">
         <main className="flex-1 flex flex-col items-center justify-center p-6 relative">
           <button onClick={cancelRecording} className="absolute top-8 left-8 p-3 hover:bg-white/10 rounded-2xl transition-all active:scale-90">
             <svg className="w-6 h-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
@@ -728,12 +1090,15 @@ function App() {
           </div>
         </main>
       </div>
+      </>
     )
   }
 
   if (currentScreen === SCREENS.UPLOAD) {
     return (
-      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
+      <>
+        <LoginModal />
+        <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
         <Sidebar />
         
         <div className="flex-1 flex flex-col min-w-0">
@@ -772,13 +1137,16 @@ function App() {
           </div>
         </div>
       </div>
+      </>
     )
   }
 
   if (currentScreen === SCREENS.PROCESSING) {
     return (
-      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden">
-        <div className="text-center max-w-xs animate-fade-in">
+      <>
+        <LoginModal />
+        <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden">
+          <div className="text-center max-w-xs animate-fade-in">
           <div className="relative w-24 h-24 mx-auto mb-10">
             <div className="absolute inset-0 border-4 border-[#10a37f]/10 rounded-[2rem]"></div>
             <div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-[2rem] animate-spin"></div>
@@ -793,9 +1161,85 @@ function App() {
             {processStatus === PROCESS_STATUS.INDEXING && 'Grounding global memory...'}
             {processStatus === PROCESS_STATUS.READY && 'Ready!'}
           </p>
-          <div className="w-full bg-slate-100 dark:bg-white/5 h-1.5 rounded-full overflow-hidden">
-             <div className="h-full bg-[#10a37f] transition-all duration-500" style={{ width: processStatus === PROCESS_STATUS.UPLOADING ? '30%' : processStatus === PROCESS_STATUS.TRANSCRIBING ? '60%' : '90%' }}></div>
+            <div className="w-full bg-slate-100 dark:bg-white/5 h-1.5 rounded-full overflow-hidden">
+              <div className="h-full bg-[#10a37f] transition-all duration-500" style={{ width: processStatus === PROCESS_STATUS.UPLOADING ? '30%' : processStatus === PROCESS_STATUS.TRANSCRIBING ? '60%' : '90%' }}></div>
+            </div>
           </div>
+        </div>
+      </>
+    )
+  }
+
+  if (currentScreen === SCREENS.LOGIN || authLoading) {
+    return (
+      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden relative">
+        {/* Background gradient */}
+        <div className="absolute inset-0 bg-gradient-to-br from-[#10a37f]/5 via-transparent to-transparent pointer-events-none" />
+        
+        <div className="text-center max-w-md w-full z-10 animate-fade-in">
+          {authLoading ? (
+            <div className="space-y-6">
+              <div className="relative w-20 h-20 mx-auto">
+                <div className="absolute inset-0 border-4 border-[#10a37f]/10 rounded-[2rem]"></div>
+                <div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-[2rem] animate-spin"></div>
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <svg className="w-8 h-8 text-[#10a37f]" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                    <circle cx="8.5" cy="10.5" r="1.5" fill="currentColor"/>
+                    <circle cx="12" cy="10.5" r="1.5" fill="currentColor"/>
+                    <circle cx="15.5" cy="10.5" r="1.5" fill="currentColor"/>
+                  </svg>
+                </div>
+              </div>
+              <p className="text-sm text-slate-500 dark:text-slate-400">Loading...</p>
+            </div>
+          ) : (
+            <>
+              {/* Logo */}
+              <div className="w-20 h-20 lg:w-24 lg:h-24 bg-gradient-to-br from-[#10a37f] to-[#0d8a6a] rounded-2xl lg:rounded-3xl flex items-center justify-center mx-auto mb-8 text-white shadow-lg shadow-[#10a37f]/30">
+                <svg className="w-10 h-10 lg:w-12 lg:h-12" viewBox="0 0 24 24" fill="none">
+                  <path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                  <circle cx="8.5" cy="10.5" r="1.5" fill="currentColor"/>
+                  <circle cx="12" cy="10.5" r="1.5" fill="currentColor"/>
+                  <circle cx="15.5" cy="10.5" r="1.5" fill="currentColor"/>
+                </svg>
+              </div>
+
+              {/* Title */}
+              <h1 className="text-3xl lg:text-4xl font-bold mb-3 tracking-tight dark:text-white">
+                Welcome to VoiceMemory
+              </h1>
+              <p className="text-base text-slate-500 dark:text-slate-400 mb-10 max-w-sm mx-auto">
+                Sign in to access your audio recordings and AI-powered insights
+              </p>
+
+              {/* Error Message */}
+              {errorMessage && (
+                <div className="mb-6 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-center">
+                  <p className="text-red-500 text-sm font-medium">{errorMessage}</p>
+                </div>
+              )}
+
+              {/* Sign In Button */}
+              <button
+                onClick={handleGoogleSignIn}
+                className="w-full flex items-center justify-center gap-3 px-6 py-4 bg-white dark:bg-[#171717] border-2 border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-2xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 dark:hover:bg-[#10a37f]/10 transition-all font-semibold shadow-lg active:scale-[0.98]"
+              >
+                <svg className="w-5 h-5" viewBox="0 0 24 24">
+                  <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                  <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                  <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                  <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                </svg>
+                <span>Continue with Google</span>
+              </button>
+
+              {/* Footer */}
+              <p className="mt-8 text-xs text-slate-400 dark:text-slate-500">
+                By signing in, you agree to our Terms of Service and Privacy Policy
+              </p>
+            </>
+          )}
         </div>
       </div>
     )
