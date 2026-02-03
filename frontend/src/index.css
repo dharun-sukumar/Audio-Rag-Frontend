@@ -1,138 +1,132 @@
-@import "tailwindcss";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-@theme {
-  --color-brand-primary: #000000;
-  --color-brand-secondary: #4b5563;
-  --color-brand-accent: #10a37f; /* OpenAI Green */
-  --radius-xl: 0.75rem;
-  --radius-2xl: 1rem;
-  --radius-3xl: 1.5rem;
-  
-  --shadow-premium: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
-  --shadow-glass: 0 8px 32px 0 rgba(31, 38, 135, 0.07);
-}
-
-:root {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
-  color-scheme: light dark;
-  background-color: #ffffff;
-  color: #111827;
-}
-
-@media (prefers-color-scheme: dark) {
+@layer base {
   :root {
-    background-color: #0d0d0d; /* OpenAI Dark background */
-    color: #ececec;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    line-height: 1.5;
+    font-weight: 400;
+    color-scheme: light dark;
+    background-color: #ffffff;
+    color: #111827;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      background-color: #0d0d0d;
+      color: #ececec;
+    }
+  }
+
+  body {
+    margin: 0;
+    min-width: 320px;
+    min-height: 100vh;
   }
 }
 
-body {
-  margin: 0;
-  min-width: 320px;
-  min-height: 100vh;
+@layer components {
+  /* OpenAI style sidebar button active state */
+  .nav-item-active {
+    background-color: rgba(0, 0, 0, 0.05);
+  }
+  .dark .nav-item-active {
+    background-color: rgba(255, 255, 255, 0.1);
+  }
+
+  /* Glassmorphism Header */
+  .glass-header {
+    background: rgba(255, 255, 255, 0.8);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+  .dark .glass-header {
+    background: rgba(13, 13, 13, 0.8);
+  }
+
+  /* Glass card */
+  .glass-card {
+    background: rgba(255, 255, 255, 0.03);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+  .dark .glass-card {
+    background: rgba(255, 255, 255, 0.02);
+  }
+
+  /* Sidebar Drawer for Mobile */
+  .sidebar-drawer {
+    transform: translateX(-100%);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .sidebar-drawer.open {
+    transform: translateX(0);
+  }
+
+  .wave-bar {
+    width: 3px;
+    background-color: #10a37f;
+    border-radius: 4px;
+    animation: wave-subtle 1.2s ease-in-out infinite;
+  }
+
+  .animate-bounce-subtle {
+    animation: bounce-subtle 3s ease-in-out infinite;
+  }
+
+  .animate-fade-in {
+    animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  /* Custom Scrollbar Utility */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 4px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.1);
+    border-radius: 10px;
+  }
+  .dark .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(16, 163, 127, 0.4);
+  }
 }
 
-/* OpenAI style sidebar button active state */
-.nav-item-active {
-  background-color: rgba(0, 0, 0, 0.05);
-}
-.dark .nav-item-active {
-  background-color: rgba(255, 255, 255, 0.1);
-}
+@layer utilities {
+  /* Smooth transitions */
+  * {
+    transition: background-color 0.2s ease, border-color 0.2s ease, opacity 0.2s ease;
+  }
 
-/* Glassmorphism Header */
-.glass-header {
-  background: rgba(255, 255, 255, 0.8);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-}
-.dark .glass-header {
-  background: rgba(13, 13, 13, 0.8);
-}
+  /* Custom Waveform Animation (more subtle) */
+  @keyframes wave-subtle {
+    0%, 100% { height: 4px; transform: scaleY(1); }
+    50% { height: 24px; transform: scaleY(1.2); }
+  }
 
-/* Smooth transitions */
-* {
-  transition: background-color 0.2s ease, border-color 0.2s ease, opacity 0.2s ease;
-}
+  @keyframes bounce-subtle {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-10px); }
+  }
 
-/* Custom Waveform Animation (more subtle) */
-@keyframes wave-subtle {
-  0%, 100% { height: 4px; transform: scaleY(1); }
-  50% { height: 24px; transform: scaleY(1.2); }
-}
+  /* Premium Animations */
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
 
-@keyframes bounce-subtle {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-10px); }
-}
-
-.animate-bounce-subtle {
-  animation: bounce-subtle 3s ease-in-out infinite;
-}
-
-.wave-bar {
-  width: 3px;
-  background-color: #10a37f;
-  border-radius: 4px;
-  animation: wave-subtle 1.2s ease-in-out infinite;
+  /* OpenAI style focus ring */
+  textarea:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.2);
+  }
 }
 
 .wave-bar:nth-child(even) { animation-duration: 0.8s; }
 .wave-bar:nth-child(3n) { animation-duration: 1.5s; }
-
-/* Premium Animations */
-@keyframes fadeIn {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-.animate-fade-in {
-  animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-}
-
-/* OpenAI style focus ring */
-textarea:focus {
-  outline: none;
-  box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.2);
-}
-
-/* Sidebar Drawer for Mobile */
-.sidebar-drawer {
-  transform: translateX(-100%);
-  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.sidebar-drawer.open {
-  transform: translateX(0);
-}
-
-/* Glass card */
-.glass-card {
-  background: rgba(255, 255, 255, 0.03);
-  backdrop-filter: blur(8px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.dark .glass-card {
-  background: rgba(255, 255, 255, 0.02);
-}
-
-/* Custom Scrollbar Utility */
-.custom-scrollbar::-webkit-scrollbar {
-  width: 4px;
-}
-.custom-scrollbar::-webkit-scrollbar-track {
-  background: transparent;
-}
-.custom-scrollbar::-webkit-scrollbar-thumb {
-  background: rgba(0, 0, 0, 0.1);
-  border-radius: 10px;
-}
-.dark .custom-scrollbar::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-}
-.custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background: rgba(16, 163, 127, 0.4);
-}
