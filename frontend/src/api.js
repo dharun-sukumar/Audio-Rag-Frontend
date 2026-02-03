@@ -184,7 +184,18 @@ async function apiRequest(endpoint, options = {}) {
     }
   }
 
-  return response.json();
+  // Handle 204 No Content responses (like DELETE operations)
+  if (response.status === 204) {
+    return null;
+  }
+
+  // Check if response has content before parsing JSON
+  const contentType = response.headers.get('content-type');
+  if (contentType && contentType.includes('application/json')) {
+    return response.json();
+  }
+  
+  return null;
 }
 
 export const api = {
@@ -194,54 +205,10 @@ export const api = {
       method: 'GET',
     }),
 
-  generateUploadUrl: (filename, mime) => 
-    apiRequest('/generate-upload-url', {
-      method: 'POST',
-      body: JSON.stringify({ filename, mime }),
-    }),
-
-  processAudio: (audio_key) => 
-    apiRequest('/process-audio', {
-      method: 'POST',
-      body: JSON.stringify({ audio_key }),
-    }),
-
   askQuestion: (query) => 
     apiRequest('/ask', {
       method: 'POST',
       body: JSON.stringify({ query }),
-    }),
-
-  // Audio endpoints (updated API)
-  listAudioFiles: (page = 1, page_size = 10) => 
-    apiRequest(`/audio?page=${page}&page_size=${page_size}`, {
-      method: 'GET',
-    }),
-
-  getAudioWithTranscription: (document_id) => 
-    apiRequest(`/audio/${document_id}`, {
-      method: 'GET',
-    }),
-
-  deleteAudio: (document_id) => 
-    apiRequest(`/audio/${document_id}`, {
-      method: 'DELETE',
-    }),
-
-  getTranscription: (document_id) => 
-    apiRequest(`/transcription/${document_id}`, {
-      method: 'GET',
-    }),
-
-  // Legacy document endpoints (kept for backwards compatibility)
-  listDocuments: () => 
-    apiRequest('/documents/', {
-      method: 'GET',
-    }),
-
-  deleteDocument: (documentId) => 
-    apiRequest(`/documents/${documentId}`, {
-      method: 'DELETE',
     }),
 
   // Conversation endpoints
@@ -281,5 +248,257 @@ export const api = {
   getConversationMessages: (conversation_id, skip = 0, limit = 100) => 
     apiRequest(`/conversations/${conversation_id}/messages?skip=${skip}&limit=${limit}`, {
       method: 'GET',
+    }),
+
+  // Calendar endpoints
+  getCalendarData: (start_date, end_date) => 
+    apiRequest('/calendar/date-range', {
+      method: 'POST',
+      body: JSON.stringify({ start_date, end_date }),
+    }),
+
+  getCalendarDateDetails: (target_date) => 
+    apiRequest(`/calendar/date/${target_date}`, {
+      method: 'GET',
+    }),
+
+  // Memory endpoints
+    uploadMemory: async (file, metadata) => {
+    const token = await getAuthToken(false);
+    if (!token) {
+      throw new Error('No authentication token available');
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+    if (metadata) {
+      formData.append('metadata', JSON.stringify(metadata));
+    }
+
+    const response = await fetch(`${API_BASE_URL}/memories/upload`, {
+      method: 'POST',
+      headers: {
+        'authorization': `Bearer ${token.trim()}`,
+      },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      let errorData;
+      try {
+        errorData = await response.json();
+      } catch (e) {
+        errorData = { detail: `HTTP ${response.status} ${response.statusText}` };
+      }
+      const errorMessage = errorData.detail?.[0]?.msg || errorData.detail || errorData.message || `Upload failed with status ${response.status}`;
+      throw new Error(errorMessage);
+    }
+
+    return response.json();
+  },
+
+  createMemory: (memoryData) =>
+    apiRequest('/memories', {
+      method: 'POST',
+      body: JSON.stringify(memoryData),
+    }),
+
+  createTextMemory: async (textContent, metadata) => {
+    const token = await getAuthToken(false);
+    if (!token) {
+      throw new Error('No authentication token available');
+    }
+
+    // Prepare form data
+    const formData = new URLSearchParams();
+    formData.append('text_content', textContent);
+    
+    // Only add metadata if it exists and has content
+    if (metadata && Object.keys(metadata).length > 0) {
+      const metadataString = typeof metadata === 'string' ? metadata : JSON.stringify(metadata);
+      formData.append('metadata', metadataString);
+    }
+
+    console.log('Sending text memory request:', {
+      text_content_length: textContent.length,
+      has_metadata: metadata && Object.keys(metadata).length > 0,
+      metadata: metadata && Object.keys(metadata).length > 0 ? metadata : null
+    });
+
+    const response = await fetch(`${API_BASE_URL}/memories/text`, {
+      method: 'POST',
+      headers: {
+        'authorization': `Bearer ${token.trim()}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: formData.toString(),
+    });
+
+    if (!response.ok) {
+      let errorData;
+      let errorText;
+      try {
+        errorText = await response.text();
+        console.error('Error response text:', errorText);
+        try {
+          errorData = JSON.parse(errorText);
+        } catch (e) {
+          // If not JSON, use the text as the error message
+          errorData = { detail: errorText || `HTTP ${response.status} ${response.statusText}` };
+        }
+      } catch (e) {
+        errorData = { detail: `HTTP ${response.status} ${response.statusText}` };
+      }
+      
+      const errorMessage = errorData.detail?.[0]?.msg || 
+                          (Array.isArray(errorData.detail) ? errorData.detail.join(', ') : errorData.detail) || 
+                          errorData.message || 
+                          errorText ||
+                          `Failed to create text memory with status ${response.status}`;
+      throw new Error(errorMessage);
+    }
+
+    return response.json();
+  },
+
+  listMemories: (filters = {}) => {
+    const {
+      page = 1,
+      page_size = 20,
+      media_type = null,
+      topic = null,
+      mood = null,
+      status_filter = null,
+      search = null,
+      tag_ids = null, // Can be array or comma-separated string
+    } = filters;
+
+    const params = new URLSearchParams({ 
+      page: page.toString(), 
+      page_size: page_size.toString() 
+    });
+    
+    if (media_type) params.append('media_type', media_type);
+    if (topic) params.append('topic', topic);
+    if (mood) params.append('mood', mood.toString());
+    if (status_filter) params.append('status_filter', status_filter);
+    if (search) params.append('search', search);
+    
+    // Handle tag_ids as array or string
+    if (tag_ids) {
+      const tagIdsString = Array.isArray(tag_ids) ? tag_ids.join(',') : tag_ids;
+      if (tagIdsString) params.append('tag_ids', tagIdsString);
+    }
+    
+    return apiRequest(`/memories?${params.toString()}`, {
+      method: 'GET',
+    });
+  },
+
+  getMemory: (memory_id) =>
+    apiRequest(`/memories/${memory_id}`, {
+      method: 'GET',
+    }),
+
+  updateMemory: (memory_id, memoryData) =>
+    apiRequest(`/memories/${memory_id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(memoryData),
+    }),
+
+  deleteMemory: (memory_id) =>
+    apiRequest(`/memories/${memory_id}`, {
+      method: 'DELETE',
+    }),
+
+  getMemoryTranscript: (memory_id) =>
+    apiRequest(`/memories/${memory_id}/transcript`, {
+      method: 'GET',
+    }),
+
+  getMemoryAudio: (memory_id) => {
+    // Return the URL for the audio file
+    // The backend should serve audio files at this endpoint
+    return `${API_BASE_URL}/memories/${memory_id}/audio`
+  },
+
+  getMemoryAudioUrl: (memory_id) => {
+    // Get a signed URL for downloading the memory audio file
+    // This should return a signed/presigned URL from the backend
+    return apiRequest(`/memories/${memory_id}/audio-url`, {
+      method: 'GET',
+    })
+  },
+
+  getMemoryTextContent: async (memory_id) => {
+    // Get the text content for a text memory from the source_key file
+    // This endpoint returns JSON with a "content" field containing the text
+    const token = await getAuthToken(false);
+    const headers = {
+      'Content-Type': 'application/json',
+    };
+    
+    if (token) {
+      headers['authorization'] = `Bearer ${token.trim()}`;
+    }
+    
+    const response = await fetch(`${API_BASE_URL}/memories/${memory_id}/text`, {
+      method: 'GET',
+      headers,
+    });
+    
+    if (!response.ok) {
+      let errorData;
+      try {
+        errorData = await response.json();
+      } catch (parseError) {
+        try {
+          const text = await response.text();
+          errorData = { detail: text || `HTTP ${response.status} ${response.statusText}` };
+        } catch (textError) {
+          errorData = { detail: `HTTP ${response.status} ${response.statusText}` };
+        }
+      }
+      const errorMessage = errorData.detail?.[0]?.msg || errorData.detail || errorData.message || `API request failed with status ${response.status}`;
+      throw new Error(errorMessage);
+    }
+    
+    // Parse JSON response and extract content field
+    const data = await response.json();
+    const content = data?.content || data?.text || '';
+    
+    // Format the content: replace tabs with spaces, preserve newlines
+    return content
+      .replace(/\t/g, '  ') // Replace tabs with 2 spaces for better readability
+      .replace(/\r\n/g, '\n') // Normalize line endings
+      .replace(/\r/g, '\n'); // Handle Mac line endings
+  },
+
+  // Tag endpoints
+  createTag: (name, color) =>
+    apiRequest('/memories/tags', {
+      method: 'POST',
+      body: JSON.stringify({ name, color }),
+    }),
+
+  listTags: () =>
+    apiRequest('/memories/tags', {
+      method: 'GET',
+    }),
+
+  getTag: (tag_id) =>
+    apiRequest(`/memories/tags/${tag_id}`, {
+      method: 'GET',
+    }),
+
+  updateTag: (tag_id, name, color) =>
+    apiRequest(`/memories/tags/${tag_id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name, color }),
+    }),
+
+  deleteTag: (tag_id) =>
+    apiRequest(`/memories/tags/${tag_id}`, {
+      method: 'DELETE',
     }),
 };
