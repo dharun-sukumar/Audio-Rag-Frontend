@@ -1,10 +1,9 @@
   import { useState, useRef, useEffect, useCallback } from 'react'
+import { useNavigate, useParams, Routes, Route } from 'react-router-dom'
 import './App.css'
 import { auth, googleProvider } from './firebase'
 import { signInWithPopup, signOut, onAuthStateChanged, getIdToken } from 'firebase/auth'
 import { api } from './api'
-
-const API_BASE_URL = 'http://38.242.215.255:8000'
 
 const SCREENS = {
   MAIN: 'main',
@@ -28,7 +27,9 @@ const PROCESS_STATUS = {
   FAILED: 'failed'
 }
 
-function App() {
+function AppContent() {
+  const navigate = useNavigate()
+  const { conversationId } = useParams()
   const [currentScreen, setCurrentScreen] = useState(SCREENS.MAIN)
   const [processStatus, setProcessStatus] = useState(PROCESS_STATUS.IDLE)
   const [selectedFile, setSelectedFile] = useState(null)
@@ -44,8 +45,10 @@ function App() {
   const [calendarDate, setCalendarDate] = useState(new Date())
   const [showCalendarDropdown, setShowCalendarDropdown] = useState(false)
   const [calendarActivity, setCalendarActivity] = useState({})
+  const [loadedCalendarMonths, setLoadedCalendarMonths] = useState(new Set())
   const [selectedDateDetails, setSelectedDateDetails] = useState(null)
   const [showDateDetailsModal, setShowDateDetailsModal] = useState(false)
+  const [showProfileDialog, setShowProfileDialog] = useState(false)
   const [toasts, setToasts] = useState([])
   const [loadingConversation, setLoadingConversation] = useState(false)
   const [isRecording, setIsRecording] = useState(false)
@@ -61,8 +64,6 @@ function App() {
   const [showLoginModal, setShowLoginModal] = useState(false)
   const [imageError, setImageError] = useState(new Set())
   const [authToken, setAuthToken] = useState(null)
-  const [tokenCopied, setTokenCopied] = useState(false)
-  const [showFullToken, setShowFullToken] = useState(false)
   
   // New state for viewing recording
   const [selectedRecording, setSelectedRecording] = useState(null)
@@ -80,6 +81,7 @@ function App() {
   // Memory and tag state
   const [memories, setMemories] = useState([])
   const [memoryPagination, setMemoryPagination] = useState({ total: 0, page: 1, page_size: 20, total_pages: 0 })
+  const [memoriesLoading, setMemoriesLoading] = useState(true)
   const [tags, setTags] = useState([])
   const [memoryText, setMemoryText] = useState('')
   const [memoryTitle, setMemoryTitle] = useState(null)
@@ -95,6 +97,7 @@ function App() {
   const [selectedMemory, setSelectedMemory] = useState(null)
   const [selectedMemoryTranscript, setSelectedMemoryTranscript] = useState(null)
   const [loadingTranscript, setLoadingTranscript] = useState(false)
+  const [loadingMemory, setLoadingMemory] = useState(false)
   const [editingMemory, setEditingMemory] = useState(false)
   const [newTagName, setNewTagName] = useState('')
   const [newTagColor, setNewTagColor] = useState('#10a37f')
@@ -143,6 +146,8 @@ function App() {
   const analyserRef = useRef(null)
   const animationFrameRef = useRef(null)
   const dataArrayRef = useRef(null)
+  const authLoadingRef = useRef(true)
+  const userRef = useRef(null)
   
 
   // Audio playback state
@@ -195,7 +200,9 @@ function App() {
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       setUser(user)
+      userRef.current = user
       setAuthLoading(false)
+      authLoadingRef.current = false
       setImageError(new Set())
       if (user) {
         setShowLoginModal(false)
@@ -217,15 +224,19 @@ function App() {
 
   useEffect(() => {
     if (user) {
-      fetchConversations()
-      fetchMemories()
+      // Only fetch if auth is fully loaded
+      if (!authLoading) {
+        fetchConversations()
+        fetchMemories()
+      }
       // Tags are lazy-loaded when needed (when opening tag modal or creating memory)
     } else {
       setConversations([])
       setMemories([])
       setTags([])
+      setMemoriesLoading(false)
     }
-  }, [user])
+  }, [user, authLoading])
 
   // Refresh tokens periodically (tokens expire after 1 hour)
   useEffect(() => {
@@ -440,17 +451,6 @@ function App() {
   }, [user, calendarDate, showCalendarDropdown])
 
   // Copy token to clipboard
-  const copyToken = async () => {
-    if (!authToken) return
-    try {
-      await navigator.clipboard.writeText(authToken)
-      setTokenCopied(true)
-      setTimeout(() => setTokenCopied(false), 2000)
-    } catch (err) {
-      console.error('Failed to copy token:', err)
-    }
-  }
-
   const formatTime = (seconds) => {
     if (!seconds || isNaN(seconds) || !isFinite(seconds)) return '0:00'
     const totalSeconds = Math.floor(seconds)
@@ -486,37 +486,86 @@ function App() {
   }
 
   const handleSignOut = async () => {
+    const confirmed = await showConfirmation({
+      title: 'Sign Out',
+      message: 'Are you sure you want to sign out?',
+      confirmText: 'Sign Out',
+      cancelText: 'Cancel',
+      type: 'warning'
+    })
+    
+    if (!confirmed) return
+    
     try {
       await signOut(auth)
       setMessages([])
       setCurrentConversationId(null)
+      setShowProfileDialog(false)
+      navigate('/')
     } catch (error) {
       console.error('Sign out error:', error)
       setErrorMessage('Failed to sign out.')
     }
   }
 
-  // Create a new conversation
+  // Create a new conversation or navigate to existing empty one
   const createNewConversation = async () => {
-    if (!requireAuth('create conversation')) return false
+    if (!(await requireAuth('create conversation'))) return false
     
     try {
+      // First, check if current conversation is already empty
+      if (currentConversationId && messages.length === 0) {
+        // Already in an empty conversation, just ensure we're on the right screen
+        setCurrentScreen(SCREENS.MAIN)
+        navigate(`/conversation/${currentConversationId}`)
+        return true
+      }
+      
+      // Find empty conversations (message_count === 0 or null/undefined)
+      // Filter and get the most recent one in a single pass for efficiency
+      let mostRecentEmpty = null
+      let mostRecentDate = 0
+      
+      for (const conv of conversations) {
+        const messageCount = conv.message_count ?? 0
+        if (messageCount === 0) {
+          const createdDate = new Date(conv.created_at || 0).getTime()
+          if (createdDate > mostRecentDate) {
+            mostRecentDate = createdDate
+            mostRecentEmpty = conv
+          }
+        }
+      }
+      
+      // If we found an empty conversation, navigate to it
+      if (mostRecentEmpty) {
+        console.log('Found existing empty conversation, navigating to it:', mostRecentEmpty.id)
+        // Just navigate - loadConversationById will handle the rest via useEffect
+        navigate(`/conversation/${mostRecentEmpty.id}`)
+        return true
+      }
+      
+      // No empty conversation found, create a new one
       console.log('Creating new conversation...')
       const conversation = await api.createConversation('New Chat')
       console.log('Conversation created:', conversation)
-      setCurrentConversationId(conversation.id)
-      setMessages([])
-      setErrorMessage('')
       
-      // Navigate to main chat screen
-      setCurrentScreen(SCREENS.MAIN)
+      // Optimistically add to list (will be refreshed by fetchConversations)
+      setConversations(prev => [conversation, ...prev])
       
-      // Refresh conversations list and calendar
-      fetchConversations()
+      // Navigate to the new conversation route
+      // The useEffect will handle loading the conversation
+      navigate(`/conversation/${conversation.id}`)
+      
+      // Refresh conversations list in background (to get accurate counts)
+      fetchConversations().catch(err => {
+        console.error('Error refreshing conversations:', err)
+      })
+      
       if (showCalendarDropdown) {
         fetchCalendarData(calendarDate)
       }
-      showToast('New conversation created!', 'success')
+      
       return true
     } catch (err) {
       console.error('Failed to create conversation:', err)
@@ -526,36 +575,18 @@ function App() {
     }
   }
 
-  // Load a conversation
+
+  // Load a conversation (public function that navigates)
   const loadConversation = async (conversation) => {
-    if (!requireAuth('load conversation')) return
+    if (!(await requireAuth('load conversation'))) return
     
+    // Set loading state immediately for better UX
     setLoadingConversation(true)
-    try {
-      console.log('Loading conversation:', conversation.id)
-      setCurrentConversationId(conversation.id)
-      setErrorMessage('')
-      
-      // Navigate to main chat screen
-      setCurrentScreen(SCREENS.MAIN)
-      
-      // Fetch messages for this conversation
-      const messages = await api.getConversationMessages(conversation.id, 0, 100)
-      console.log('Messages fetched:', messages)
-      
-      // Messages are already in the correct format from the API
-      setMessages(messages || [])
-      
-      if (window.innerWidth < 1024) setSidebarOpen(false)
-    } catch (err) {
-      console.error('Failed to load conversation:', err)
-      setErrorMessage(`Failed to load conversation: ${err.message}`)
-      showToast('Failed to load conversation', 'error')
-      // Clear messages on error
-      setMessages([])
-    } finally {
-      setLoadingConversation(false)
-    }
+    setMessages([])
+    setCurrentScreen(SCREENS.MAIN)
+    
+    // Navigate to the conversation route
+    navigate(`/conversation/${conversation.id}`)
   }
 
   // Start editing conversation title
@@ -628,10 +659,11 @@ function App() {
     console.log('Deleting conversation (optimistic):', conversationId)
     setConversations(prev => prev.filter(conv => conv.id !== conversationId))
     
-    // If we're deleting the current conversation, clear it
+    // If we're deleting the current conversation, clear it and navigate away
     if (currentConversationId === conversationId) {
       setCurrentConversationId(null)
       setMessages([])
+      navigate('/')
     }
     
     try {
@@ -655,13 +687,94 @@ function App() {
   }
 
   // Check if user needs to login for protected actions
-  const requireAuth = (action) => {
-    if (!user) {
+  const requireAuth = async (action) => {
+    // Wait for auth to finish loading before checking user
+    if (authLoadingRef.current) {
+      // Wait for auth to finish loading (max 2 seconds)
+      let attempts = 0
+      while (authLoadingRef.current && attempts < 20) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+        attempts++
+      }
+    }
+    
+    // Check user state - use both ref and Firebase's currentUser as fallback
+    // Firebase's currentUser is synchronous and available immediately if logged in
+    const currentUser = userRef.current || auth.currentUser
+    
+    if (!currentUser) {
       setShowLoginModal(true)
       return false
     }
+    
+    // Update refs if they're out of sync (shouldn't happen, but just in case)
+    if (userRef.current !== currentUser) {
+      userRef.current = currentUser
+    }
+    
     return true
   }
+
+  // Load a conversation by ID (internal function)
+  const loadConversationById = useCallback(async (conversationId) => {
+    if (!(await requireAuth('load conversation'))) return
+    
+    setLoadingConversation(true)
+    try {
+      console.log('Loading conversation by ID:', conversationId)
+      setCurrentConversationId(conversationId)
+      setErrorMessage('')
+      
+      // Navigate to main chat screen
+      setCurrentScreen(SCREENS.MAIN)
+      
+      // Fetch messages for this conversation
+      const messages = await api.getConversationMessages(conversationId, 0, 100)
+      console.log('Messages fetched:', messages)
+      
+      // Messages are already in the correct format from the API
+      setMessages(messages || [])
+      
+      if (window.innerWidth < 1024) setSidebarOpen(false)
+    } catch (err) {
+      console.error('Failed to load conversation:', err)
+      setErrorMessage(`Failed to load conversation: ${err.message}`)
+      // Clear messages on error
+      setMessages([])
+    } finally {
+      setLoadingConversation(false)
+    }
+  }, [])
+
+  // Load conversation from URL parameter
+  useEffect(() => {
+    if (!user) return
+    
+    if (conversationId) {
+      // Only load if it's different from current conversation
+      if (conversationId !== currentConversationId) {
+        // Wait for conversations to load if not available yet
+        if (conversations.length === 0) {
+          // Conversations not loaded yet, wait a bit
+          return
+        }
+        
+        const conversation = conversations.find(conv => conv.id === conversationId)
+        if (conversation) {
+          loadConversationById(conversationId)
+        } else {
+          // Conversation not found, navigate to home
+          navigate('/')
+          setCurrentConversationId(null)
+          setMessages([])
+        }
+      }
+    } else if (!conversationId && currentConversationId) {
+      // URL doesn't have conversationId but we have one loaded - clear it
+      setCurrentConversationId(null)
+      setMessages([])
+    }
+  }, [conversationId, user, conversations, currentConversationId, navigate, loadConversationById])
 
   // Get user initials for avatar
   const getUserInitials = (user) => {
@@ -905,10 +1018,10 @@ function App() {
   // View a recording with its transcription (with progressive loading)
   // --- ACTIONS ---
 
-  const handleFileSelect = (e) => {
+  const handleFileSelect = async (e) => {
     const file = e.target.files[0]
     if (file && (file.type.startsWith('audio/') || file.type.startsWith('video/'))) {
-      if (!requireAuth('upload')) {
+      if (!(await requireAuth('upload'))) {
         e.target.value = '' 
         return
       }
@@ -935,7 +1048,7 @@ function App() {
 
   const startRecording = async () => {
     setErrorMessage('')
-    if (!requireAuth('record')) return
+    if (!(await requireAuth('record'))) return
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setErrorMessage('Your browser does not support audio recording.')
       return
@@ -987,7 +1100,7 @@ function App() {
   }
 
   const uploadAndProcess = async () => {
-    if (!requireAuth('upload')) {
+    if (!(await requireAuth('upload'))) {
       console.error('User not authenticated, cannot upload')
       return
     }
@@ -1066,9 +1179,8 @@ function App() {
       console.log('Refreshing data to get latest state...')
       // Refresh to get the latest state from backend (including processing status)
       fetchMemories()
-      if (showCalendarDropdown) {
-        fetchCalendarData(calendarDate)
-      }
+      // Always reload calendar data after memory upload (force refresh to get new memory)
+      fetchCalendarData(calendarDate, true)
       
       // Reset memory form
       setMemoryTitle(null)
@@ -1093,7 +1205,7 @@ function App() {
   }
 
   const createTextMemory = async () => {
-    if (!requireAuth('create text memory')) {
+    if (!(await requireAuth('create text memory'))) {
       console.error('User not authenticated, cannot create text memory')
       return
     }
@@ -1167,9 +1279,8 @@ function App() {
       
       // Refresh to get the latest state from backend
       fetchMemories()
-      if (showCalendarDropdown) {
-        fetchCalendarData(calendarDate)
-      }
+      // Always reload calendar data after memory upload (force refresh to get new memory)
+      fetchCalendarData(calendarDate, true)
       
       // Reset memory form
       setMemoryTitle(null)
@@ -1278,6 +1389,20 @@ function App() {
   }
 
   const viewMemoryDetail = async (memory) => {
+    // Navigate immediately with basic memory data for better UX
+    setSelectedMemory(memory)
+    setCurrentScreen(SCREENS.VIEW_MEMORY)
+    setLoadingMemory(true)
+    setLoadingTranscript(false)
+    setSelectedMemoryTranscript(null)
+    setIsPlaying(false)
+    setCurrentPlaybackTime(0)
+    setAudioUrl(null)
+    
+    // Close sidebar on mobile
+    if (window.innerWidth < 1024) setSidebarOpen(false)
+    
+    // Load full details in the background
     try {
       // Fetch full memory details from API
       const fullMemory = await api.getMemory(memory.id)
@@ -1339,13 +1464,6 @@ function App() {
       setMemoryDate(fullMemory.memory_date || '')
       setSelectedTags(fullMemory.tags || [])
       setEditingMemory(false)
-      setSelectedMemoryTranscript(null)
-      setLoadingTranscript(false)
-      setIsPlaying(false)
-      setCurrentPlaybackTime(0)
-      
-      // Navigate to view memory screen
-      setCurrentScreen(SCREENS.VIEW_MEMORY)
       
       // Fetch transcript for audio/video memories if status is completed
       if ((fullMemory.media_type === 'audio' || fullMemory.media_type === 'video') && fullMemory.status === 'completed') {
@@ -1391,6 +1509,8 @@ function App() {
     } catch (err) {
       console.error('Failed to load memory details:', err)
       showToast('Failed to load memory details', 'error')
+    } finally {
+      setLoadingMemory(false)
     }
   }
 
@@ -1461,7 +1581,7 @@ function App() {
 
   const askQuestion = async () => {
     if (!inputQuery.trim()) return
-    if (!requireAuth('ask')) return
+    if (!(await requireAuth('ask'))) return
     
     // Create a conversation if one doesn't exist
     if (!currentConversationId) {
@@ -1508,10 +1628,18 @@ function App() {
   const fetchMemories = async (customFilters = {}) => {
     if (!user) {
       console.log('fetchMemories: No user, skipping')
+      setMemoriesLoading(false)
+      return
+    }
+    
+    // Don't fetch if auth is still loading
+    if (authLoading) {
+      console.log('fetchMemories: Auth still loading, skipping')
       return
     }
     
     try {
+      setMemoriesLoading(true)
       const token = await getIdToken(user, false)
       if (!token) {
         console.warn('fetchMemories: No token available, waiting...')
@@ -1548,8 +1676,12 @@ function App() {
         page_size: data.page_size || 20,
         total_pages: data.total_pages || 0
       })
-      } catch (err) {
+    } catch (err) {
       console.error('Error fetching memories:', err)
+      setMemories([])
+      setMemoryPagination({ total: 0, page: 1, page_size: 20, total_pages: 0 })
+    } finally {
+      setMemoriesLoading(false)
     }
   }
 
@@ -1618,29 +1750,103 @@ function App() {
 
   // --- CALENDAR HELPER FUNCTIONS ---
   
-  const fetchCalendarData = async (date) => {
+  const fetchCalendarData = async (date, forceRefresh = false) => {
     if (!user) return
     
     try {
       const year = date.getFullYear()
       const month = date.getMonth()
       
+      // Create a unique key for this month (YYYY-MM)
+      const monthKey = `${year}-${String(month + 1).padStart(2, '0')}`
+      
+      // Check if we already have data for this month and don't need to refresh
+      if (!forceRefresh && loadedCalendarMonths.has(monthKey)) {
+        console.log('Calendar data already loaded for month:', monthKey)
+        return
+      }
+      
       // Get first and last day of month
       const firstDay = new Date(year, month, 1)
       const lastDay = new Date(year, month + 1, 0)
       
-      // Format dates as YYYY-MM-DD
-      const start_date = firstDay.toISOString().split('T')[0]
-      const end_date = lastDay.toISOString().split('T')[0]
+      // Format dates as YYYY-MM-DD (using local time, consistent with getEmojiForDate)
+      const formatDateLocal = (date) => {
+        const year = date.getFullYear()
+        const month = String(date.getMonth() + 1).padStart(2, '0')
+        const day = String(date.getDate()).padStart(2, '0')
+        return `${year}-${month}-${day}`
+      }
       
-      console.log('Fetching calendar data for:', start_date, 'to', end_date)
-      const data = await api.getCalendarData(start_date, end_date)
-      console.log('Calendar data received:', data)
+      const start_date = formatDateLocal(firstDay)
+      const end_date = formatDateLocal(lastDay)
       
-      setCalendarActivity(data || {})
+      console.log('Fetching memories for calendar:', start_date, 'to', end_date)
+      
+      // Fetch memories - get all pages if needed
+      let allMemories = []
+      let page = 1
+      const pageSize = 100
+      let hasMore = true
+      
+      while (hasMore) {
+        const filters = {
+          page: page,
+          page_size: pageSize,
+        }
+        
+        const data = await api.listMemories(filters)
+        const memories = data.items || []
+        allMemories = [...allMemories, ...memories]
+        
+        // Check if there are more pages
+        hasMore = memories.length === pageSize && page < 10 // Safety limit of 10 pages
+        page++
+      }
+      
+      const memoriesList = allMemories
+      console.log(`Fetched ${memoriesList.length} total memories for calendar`)
+      
+      // Group memories by date (YYYY-MM-DD) - merge with existing data
+      setCalendarActivity(prevActivity => {
+        const activityByDate = { ...prevActivity }
+        
+        memoriesList.forEach(memory => {
+          // Use memory_date if available, otherwise use created_at
+          const memoryDate = memory.memory_date || memory.created_at
+          if (!memoryDate) return
+          
+          // Convert to local date and format as YYYY-MM-DD (consistent with getEmojiForDate)
+          const date = new Date(memoryDate)
+          const year = date.getFullYear()
+          const month = String(date.getMonth() + 1).padStart(2, '0')
+          const day = String(date.getDate()).padStart(2, '0')
+          const dateStr = `${year}-${month}-${day}`
+          
+          // Check if date is within the month range (compare as strings)
+          if (dateStr >= start_date && dateStr <= end_date) {
+            if (!activityByDate[dateStr]) {
+              activityByDate[dateStr] = {
+                memories: [],
+                date: dateStr
+              }
+            }
+            // Check if this memory already exists to avoid duplicates
+            const existingMemory = activityByDate[dateStr].memories.find(m => m.id === memory.id)
+            if (!existingMemory) {
+              activityByDate[dateStr].memories.push(memory)
+            }
+          }
+        })
+        
+        console.log('Calendar activity data updated for month:', monthKey)
+        return activityByDate
+      })
+      
+      // Mark this month as loaded
+      setLoadedCalendarMonths(prev => new Set([...prev, monthKey]))
     } catch (err) {
       console.error('Error fetching calendar data:', err)
-      setCalendarActivity({})
     }
   }
   
@@ -1672,26 +1878,35 @@ function App() {
     
     // Format date as YYYY-MM-DD without timezone conversion
     const year = date.getFullYear()
-    const month = String(date.getMonth() + 1).padStart(2, '0')
+    const month = String(date.getMonth() + 1).padStart(2, '0')  
     const day = String(date.getDate()).padStart(2, '0')
     const dateStr = `${year}-${month}-${day}`
     
     const dayActivity = calendarActivity[dateStr]
     
-    if (!dayActivity) return null
-    
-    const hasConversations = dayActivity.conversations && dayActivity.conversations.length > 0
-    const hasRecordings = dayActivity.recordings && dayActivity.recordings.length > 0
-    
-    if (hasConversations && hasRecordings) {
-      return '🎁' // Both
-    } else if (hasConversations) {
-      return '😊' // Conversation
-    } else if (hasRecordings) {
-      return '🎙️' // Recording
+    if (!dayActivity || !dayActivity.memories || dayActivity.memories.length === 0) {
+      return null
     }
     
-    return null
+    // Calculate average mood for the day
+    const memories = dayActivity.memories
+    const memoriesWithMood = memories.filter(m => m.mood && m.mood >= 1 && m.mood <= 5)
+    
+    if (memoriesWithMood.length > 0) {
+      // Calculate average mood
+      const sum = memoriesWithMood.reduce((acc, m) => acc + m.mood, 0)
+      const average = sum / memoriesWithMood.length
+      // Round to nearest integer (1-5)
+      const averageMood = Math.round(average)
+      
+      // Map mood (1-5) to emojis: 😢 😕 😐 🙂 😄
+      const moodEmojis = ['😢', '😕', '😐', '🙂', '😄']
+      const emojiIndex = Math.min(Math.max(averageMood - 1, 0), 4)
+      return moodEmojis[emojiIndex]
+    }
+    
+    // Default emoji if no mood is set
+    return '📝'
   }
   
   const isToday = (date) => {
@@ -1699,11 +1914,60 @@ function App() {
     const today = new Date()
     return date.toDateString() === today.toDateString()
   }
+
+  // Group conversations by date
+  const groupConversationsByDate = (conversations) => {
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    
+    const yesterday = new Date(today)
+    yesterday.setDate(yesterday.getDate() - 1)
+    
+    const thisWeekStart = new Date(today)
+    thisWeekStart.setDate(today.getDate() - today.getDay())
+    
+    const lastWeekStart = new Date(thisWeekStart)
+    lastWeekStart.setDate(lastWeekStart.getDate() - 7)
+    const lastWeekEnd = new Date(thisWeekStart)
+    lastWeekEnd.setDate(lastWeekEnd.getDate() - 1)
+    
+    const groups = {
+      'Today': [],
+      'Yesterday': [],
+      'This Week': [],
+      'Last Week': [],
+      'Older': []
+    }
+    
+    conversations.forEach(conv => {
+      const convDate = new Date(conv.updated_at || conv.created_at)
+      convDate.setHours(0, 0, 0, 0)
+      
+      if (convDate.getTime() === today.getTime()) {
+        groups['Today'].push(conv)
+      } else if (convDate.getTime() === yesterday.getTime()) {
+        groups['Yesterday'].push(conv)
+      } else if (convDate >= thisWeekStart && convDate < today) {
+        groups['This Week'].push(conv)
+      } else if (convDate >= lastWeekStart && convDate <= lastWeekEnd) {
+        groups['Last Week'].push(conv)
+      } else {
+        groups['Older'].push(conv)
+      }
+    })
+    
+    // Return only groups that have conversations
+    return Object.entries(groups)
+      .filter(([_, convs]) => convs.length > 0)
+      .map(([label, convs]) => ({ label, conversations: convs }))
+  }
   
   const changeMonth = (direction) => {
     setCalendarDate(prev => {
       const newDate = new Date(prev)
       newDate.setMonth(newDate.getMonth() + direction)
+      // Fetch data for the new month if not already cached
+      fetchCalendarData(newDate)
       return newDate
     })
   }
@@ -1718,19 +1982,21 @@ function App() {
     const dateStr = `${year}-${month}-${day}`
     
     // Check if there's activity on this date
-    const hasActivity = calendarActivity[dateStr]
-    if (!hasActivity) return
-    
-    try {
-      console.log('Fetching details for date:', dateStr)
-      const details = await api.getCalendarDateDetails(dateStr)
-      console.log('Date details:', details)
-      setSelectedDateDetails(details)
-      setShowDateDetailsModal(true)
-    } catch (err) {
-      console.error('Error fetching date details:', err)
-      setErrorMessage(`Failed to load details: ${err.message}`)
+    const dayActivity = calendarActivity[dateStr]
+    if (!dayActivity || !dayActivity.memories || dayActivity.memories.length === 0) {
+      return
     }
+    
+    // Format details from memories
+    const details = {
+      date: dateStr,
+      memories: dayActivity.memories,
+      total_count: dayActivity.memories.length
+    }
+    
+    console.log('Date details:', details)
+    setSelectedDateDetails(details)
+    setShowDateDetailsModal(true)
   }
 
   // --- UI COMPONENTS (JSX blocks to avoid remounting bugs) ---
@@ -1783,174 +2049,84 @@ function App() {
           <div className={`flex-1 overflow-y-auto custom-scrollbar ${!sidebarOpen && 'lg:hidden'} py-4`}>
             <div className="px-2 mb-6">
               <p className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-2 mb-2">Conversations</p>
-              <div className="space-y-1">
+              <div className="space-y-4">
                 {conversations.length > 0 ? (
-                  conversations.map((conv) => (
-                    <div 
-                      key={conv.id} 
-                      onClick={() => editingConversationId !== conv.id && loadConversation(conv)}
-                      className={`group flex items-center justify-between p-2 rounded-xl hover:bg-white dark:hover:bg-white/5 border transition-all ${
-                        editingConversationId === conv.id ? 'cursor-default' : 'cursor-pointer'
-                      } ${
-                        currentConversationId === conv.id 
-                          ? 'bg-[#10a37f]/10 border-[#10a37f]/30' 
-                          : 'border-transparent hover:border-slate-200 dark:hover:border-white/10'
-                      }`}
-                    >
-                      <div className="flex items-center gap-3 min-w-0 flex-1">
-                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                          currentConversationId === conv.id 
-                            ? 'bg-[#10a37f] text-white' 
-                            : 'bg-blue-500/10 text-blue-500'
-                        }`}>
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          {editingConversationId === conv.id ? (
-                            <input
-                              type="text"
-                              value={editingConversationTitle}
-                              onChange={(e) => setEditingConversationTitle(e.target.value)}
-                              onBlur={() => saveConversationTitle(conv.id)}
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter') saveConversationTitle(conv.id)
-                                if (e.key === 'Escape') cancelEditingConversation()
-                              }}
-                              onClick={(e) => e.stopPropagation()}
-                              className="w-full text-xs font-semibold dark:text-white bg-white dark:bg-slate-800 border border-[#10a37f] rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[#10a37f]"
-                              autoFocus
-                            />
-                          ) : (
-                            <>
-                              <p className="text-xs font-semibold dark:text-white truncate">{conv.title || 'Untitled Chat'}</p>
-                              <p className="text-[10px] text-slate-500">{conv.message_count || 0} messages</p>
-                            </>
+                  groupConversationsByDate(conversations).map((group) => (
+                    <div key={group.label} className="space-y-1">
+                      <p className="text-[9px] font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider px-2 mb-1.5">
+                        {group.label}
+                      </p>
+                      {group.conversations.map((conv) => (
+                        <div 
+                          key={conv.id} 
+                          onClick={() => editingConversationId !== conv.id && loadConversation(conv)}
+                          className={`group flex items-center justify-between p-2 rounded-xl hover:bg-white dark:hover:bg-white/5 border transition-all ${
+                            editingConversationId === conv.id ? 'cursor-default' : 'cursor-pointer'
+                          } ${
+                            currentConversationId === conv.id 
+                              ? 'bg-[#10a37f]/10 border-[#10a37f]/30' 
+                              : 'border-transparent hover:border-slate-200 dark:hover:border-white/10'
+                          }`}
+                        >
+                          <div className="flex items-center gap-3 min-w-0 flex-1">
+                            <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                              currentConversationId === conv.id 
+                                ? 'bg-[#10a37f] text-white' 
+                                : 'bg-blue-500/10 text-blue-500'
+                            }`}>
+                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              {editingConversationId === conv.id ? (
+                                <input
+                                  type="text"
+                                  value={editingConversationTitle}
+                                  onChange={(e) => setEditingConversationTitle(e.target.value)}
+                                  onBlur={() => saveConversationTitle(conv.id)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') saveConversationTitle(conv.id)
+                                    if (e.key === 'Escape') cancelEditingConversation()
+                                  }}
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="w-full text-xs font-semibold dark:text-white bg-white dark:bg-slate-800 border border-[#10a37f] rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[#10a37f]"
+                                  autoFocus
+                                />
+                              ) : (
+                                <>
+                                  <p className="text-xs font-semibold dark:text-white truncate">{conv.title || 'Untitled Chat'}</p>
+                                  <p className="text-[10px] text-slate-500">{conv.message_count || 0} messages</p>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                          {editingConversationId !== conv.id && (
+                            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100">
+                              <button
+                                onClick={(e) => startEditingConversation(conv, e)}
+                                className="p-1.5 hover:bg-slate-200 dark:hover:bg-white/10 text-slate-400 hover:text-[#10a37f] rounded-lg transition-all"
+                                title="Rename conversation"
+                              >
+                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                                </svg>
+                              </button>
+                              <button
+                                onClick={(e) => deleteConversation(conv.id, e)}
+                                className="p-1.5 hover:bg-red-50 dark:hover:bg-red-500/10 text-slate-400 hover:text-red-500 rounded-lg transition-all"
+                                title="Delete conversation"
+                              >
+                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                </svg>
+                              </button>
+                            </div>
                           )}
                         </div>
-                      </div>
-                      {editingConversationId !== conv.id && (
-                        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100">
-                          <button
-                            onClick={(e) => startEditingConversation(conv, e)}
-                            className="p-1.5 hover:bg-slate-200 dark:hover:bg-white/10 text-slate-400 hover:text-[#10a37f] rounded-lg transition-all"
-                            title="Rename conversation"
-                          >
-                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
-                            </svg>
-                          </button>
-                          <button
-                            onClick={(e) => deleteConversation(conv.id, e)}
-                            className="p-1.5 hover:bg-red-50 dark:hover:bg-red-500/10 text-slate-400 hover:text-red-500 rounded-lg transition-all"
-                            title="Delete conversation"
-                          >
-                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                            </svg>
-                          </button>
-                        </div>
-                      )}
+                      ))}
                     </div>
                   ))
                 ) : (
                   <div className="p-4 text-center"><p className="text-xs text-slate-500 dark:text-slate-400">No conversations yet</p></div>
-                )}
-              </div>
-            </div>
-            <div className="px-2 mb-4">
-              <div className="flex items-center justify-between px-2 mb-2">
-                <p className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">
-                  Memories {memoryPagination.total > 0 && <span className="text-slate-500">({memoryPagination.total})</span>}
-                </p>
-              </div>
-
-              <div className="space-y-1">
-                {memories.length > 0 ? (
-                  <>
-                    {memories.map((memory) => (
-                    <div 
-                        key={memory.id}
-                      onClick={() => {
-                          viewMemoryDetail(memory)
-                        if (window.innerWidth < 1024) setSidebarOpen(false)
-                      }}
-                        className="group p-2 rounded-xl hover:bg-white dark:hover:bg-white/5 border border-transparent hover:border-slate-200 dark:hover:border-white/10 transition-all cursor-pointer"
-                    >
-                        <div className="flex items-start gap-3 min-w-0">
-                          <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                            memory.media_type === 'video' ? 'bg-blue-500/10 text-blue-500' :
-                            memory.media_type === 'text' ? 'bg-orange-500/10 text-orange-500' :
-                            'bg-purple-500/10 text-purple-500'
-                          }`}>
-                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              {memory.media_type === 'video' ? (
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                              ) : memory.media_type === 'text' ? (
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                              ) : (
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                              )}
-                            </svg>
-                        </div>
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-1 mb-0.5">
-                              <p className="text-xs font-semibold dark:text-white truncate">{memory.title || 'Untitled Memory'}</p>
-                              {memory.mood && (
-                                <span className="text-xs">
-                                  {['😢', '😕', '😐', '🙂', '😄'][memory.mood - 1]}
-                                </span>
-                              )}
-                        </div>
-                            <p className="text-[10px] text-slate-500 line-clamp-1">{memory.description || memory.topic || 'No description'}</p>
-                            {memory.tags && memory.tags.length > 0 && (
-                              <div className="flex flex-wrap gap-1 mt-1">
-                                {memory.tags.slice(0, 2).map(tag => (
-                                  <span 
-                                    key={tag.id}
-                                    className="text-[9px] px-1.5 py-0.5 rounded"
-                                    style={{ backgroundColor: tag.color + '20', color: tag.color }}
-                                  >
-                                    {tag.name}
-                                  </span>
-                                ))}
-                      </div>
-                            )}
-                    </div>
-                        </div>
-                      </div>
-                    ))}
-                    
-                    {/* Pagination */}
-                    {memoryPagination.total_pages > 1 && (
-                      <div className="flex items-center justify-between px-2 py-2">
-                        <button
-                          onClick={() => fetchMemories({ page: Math.max(1, memoryPagination.page - 1) })}
-                          disabled={memoryPagination.page === 1}
-                          className="text-[10px] px-2 py-1 bg-slate-100 dark:bg-white/5 rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-slate-200 dark:hover:bg-white/10 transition-colors"
-                        >
-                          ← Prev
-                        </button>
-                        <span className="text-[10px] text-slate-500">
-                          {memoryPagination.page} / {memoryPagination.total_pages}
-                        </span>
-                        <button
-                          onClick={() => fetchMemories({ page: Math.min(memoryPagination.total_pages, memoryPagination.page + 1) })}
-                          disabled={memoryPagination.page === memoryPagination.total_pages}
-                          className="text-[10px] px-2 py-1 bg-slate-100 dark:bg-white/5 rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-slate-200 dark:hover:bg-white/10 transition-colors"
-                        >
-                          Next →
-                        </button>
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <div className="p-4 text-center">
-                    <p className="text-xs text-slate-500 dark:text-slate-400">
-                      {memorySearchQuery || memoryMediaTypeFilter || memoryMoodFilter || selectedFilterTags.length > 0
-                        ? 'No memories match your filters'
-                        : 'No memories yet'}
-                    </p>
-                  </div>
                 )}
               </div>
             </div>
@@ -1960,7 +2136,14 @@ function App() {
           <div className={`mt-auto pt-4 border-t border-slate-200 dark:border-white/10 ${!sidebarOpen && 'lg:border-0'}`}>
             {user ? (
               <div className="space-y-2">
-                <div className={`flex items-center gap-3 p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors ${!sidebarOpen && 'lg:justify-center'}`}>
+                <div 
+                  className={`flex items-center gap-3 p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors cursor-pointer ${!sidebarOpen && 'lg:justify-center'}`}
+                  onClick={() => {
+                    if (!sidebarOpen) {
+                      setShowProfileDialog(true)
+                    }
+                  }}
+                >
                   {user.photoURL && !imageError.has('profile') ? (
                     <img src={user.photoURL} alt={user.displayName || user.email} className="w-9 h-9 rounded-full flex-shrink-0 object-cover border-2 border-slate-200 dark:border-white/10" onError={() => setImageError(prev => new Set(prev).add('profile'))} />
                   ) : (
@@ -1972,55 +2155,7 @@ function App() {
                   </div>
                 </div>
                 {sidebarOpen && (
-                  <>
-                    <div className="space-y-2">
-                      <button
-                        onClick={() => setShowFullToken(!showFullToken)}
-                        className="w-full flex items-center justify-between px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-50 dark:hover:bg-white/5 rounded-xl transition-all"
-                      >
-                        <div className="flex items-center gap-2">
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
-                          </svg>
-                          <span>Auth Token</span>
-                        </div>
-                        <svg className={`w-4 h-4 transition-transform ${showFullToken ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                        </svg>
-                      </button>
-                      {showFullToken && authToken && (
-                        <div className="p-3 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10 space-y-2">
-                          <div>
-                            <p className="text-[10px] font-semibold text-[#10a37f] mb-1">Firebase ID Token</p>
-                            <div className="flex items-start justify-between gap-2">
-                              <code className="flex-1 text-[10px] font-mono text-slate-600 dark:text-slate-300 break-all leading-relaxed">
-                                {authToken}
-                              </code>
-                              <button
-                                onClick={copyToken}
-                                className="flex-shrink-0 p-1.5 hover:bg-slate-200 dark:hover:bg-white/10 rounded-lg transition-colors"
-                                title="Copy token"
-                              >
-                                {tokenCopied ? (
-                                  <svg className="w-4 h-4 text-[#10a37f]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                                  </svg>
-                                ) : (
-                                  <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                                  </svg>
-                                )}
-                              </button>
-                            </div>
-                          </div>
-                          <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-2">
-                            Using Firebase ID token for all API calls
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                    <button onClick={handleSignOut} className="w-full flex items-center gap-3 px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-xl transition-all"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg><span>Sign Out</span></button>
-                  </>
+                  <button onClick={handleSignOut} className="w-full flex items-center gap-3 px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-xl transition-all"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg><span>Sign Out</span></button>
                 )}
               </div>
             ) : (
@@ -2067,14 +2202,30 @@ function App() {
                 className="fixed inset-0 z-[60]" 
                 onClick={() => setShowCalendarDropdown(false)}
               />
-              <div className="absolute right-0 mt-2 z-[70] animate-fade-in">
-                <div className="bg-white dark:bg-[#171717] rounded-2xl border border-slate-200 dark:border-white/10 shadow-2xl p-5 w-80">
+              <div 
+                className="absolute right-0 mt-2 z-[70] animate-fade-in"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div 
+                  className="bg-white dark:bg-[#171717] rounded-2xl border border-slate-200 dark:border-white/10 shadow-2xl p-5 w-80"
+                >
                   {/* Calendar Header */}
                   <div className="flex items-center justify-between mb-4">
                     <h3 className="text-base font-bold text-slate-800 dark:text-white">
                       {calendarDate.toLocaleString('default', { month: 'long', year: 'numeric' })}
                     </h3>
                     <div className="flex gap-1">
+                      <button
+                        onClick={() => {
+                          const today = new Date()
+                          setCalendarDate(today)
+                          fetchCalendarData(today)
+                        }}
+                        className="px-2.5 py-1 text-xs font-semibold bg-[#10a37f] text-white rounded-lg hover:bg-[#0d8a6a] transition-colors"
+                        title="Go to today"
+                      >
+                        Today
+                      </button>
                       <button
                         onClick={() => changeMonth(-1)}
                         className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors"
@@ -2144,24 +2295,6 @@ function App() {
                         </div>
                       )
                     })}
-                  </div>
-                  
-                  {/* Legend */}
-                  <div className="mt-5 pt-4 border-t border-slate-200 dark:border-white/10">
-                    <div className="flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-1.5">
-                        <span>😊</span>
-                        <span className="text-slate-600 dark:text-slate-400">Chat</span>
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        <span>🎙️</span>
-                        <span className="text-slate-600 dark:text-slate-400">Recording</span>
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        <span>🎁</span>
-                        <span className="text-slate-600 dark:text-slate-400">Both</span>
-                      </div>
-                    </div>
                   </div>
                 </div>
               </div>
@@ -2258,35 +2391,78 @@ function App() {
           
           {/* Content */}
           <div className="p-6 overflow-y-auto max-h-[calc(80vh-120px)]">
-            {/* Conversations */}
-            {selectedDateDetails.conversations && selectedDateDetails.conversations.length > 0 && (
-              <div className="mb-6">
+            {/* Memories */}
+            {selectedDateDetails.memories && selectedDateDetails.memories.length > 0 && (
+              <div>
                 <h3 className="text-sm font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                  <span>😊</span>
-                  Conversations ({selectedDateDetails.conversations.length})
+                  <span>📝</span>
+                  Memories ({selectedDateDetails.memories.length})
                 </h3>
                 <div className="space-y-2">
-                  {selectedDateDetails.conversations.map((conv) => (
+                  {selectedDateDetails.memories.map((memory) => (
                     <div 
-                      key={conv.id}
+                      key={memory.id}
                       onClick={() => {
-                        loadConversation(conv)
+                        viewMemoryDetail(memory)
                         setShowDateDetailsModal(false)
                         setShowCalendarDropdown(false)
                       }}
                       className="p-4 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10 hover:border-[#10a37f] dark:hover:border-[#10a37f] cursor-pointer transition-all hover:shadow-md"
                     >
-                      <div className="flex items-start justify-between">
-                        <div className="flex-1">
-                          <h4 className="font-semibold text-slate-800 dark:text-white mb-1">
-                            {conv.title || 'Untitled Conversation'}
-                          </h4>
-                          <p className="text-xs text-slate-500 dark:text-slate-400">
-                            {conv.message_count} {conv.message_count === 1 ? 'message' : 'messages'}
-                          </p>
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-start gap-3 flex-1 min-w-0">
+                          <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                            memory.media_type === 'video' ? 'bg-blue-500/10 text-blue-500' :
+                            memory.media_type === 'text' ? 'bg-orange-500/10 text-orange-500' :
+                            'bg-purple-500/10 text-purple-500'
+                          }`}>
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              {memory.media_type === 'video' ? (
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                              ) : memory.media_type === 'text' ? (
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                              ) : (
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                              )}
+                            </svg>
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 mb-1">
+                              <h4 className="font-semibold text-slate-800 dark:text-white truncate">
+                                {memory.title || 'Untitled Memory'}
+                              </h4>
+                              {memory.mood && (
+                                <span className="text-sm flex-shrink-0">
+                                  {['😢', '😕', '😐', '🙂', '😄'][memory.mood - 1]}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-2">
+                              {memory.description || memory.topic || 'No description'}
+                            </p>
+                            {memory.tags && memory.tags.length > 0 && (
+                              <div className="flex flex-wrap gap-1 mt-2">
+                                {memory.tags.slice(0, 3).map((tag) => (
+                                  <span 
+                                    key={tag.id}
+                                    className="text-[10px] px-2 py-0.5 rounded-full"
+                                    style={{ 
+                                      backgroundColor: `${tag.color}20`,
+                                      color: tag.color
+                                    }}
+                                  >
+                                    {tag.name}
+                                  </span>
+                                ))}
+                                {memory.tags.length > 3 && (
+                                  <span className="text-[10px] text-slate-400">+{memory.tags.length - 3}</span>
+                                )}
+                              </div>
+                            )}
+                          </div>
                         </div>
-                        <div className="text-xs text-slate-400">
-                          {new Date(conv.created_at).toLocaleTimeString('default', { 
+                        <div className="text-xs text-slate-400 flex-shrink-0">
+                          {new Date(memory.created_at || memory.memory_date).toLocaleTimeString('default', { 
                             hour: '2-digit',
                             minute: '2-digit'
                           })}
@@ -2298,7 +2474,7 @@ function App() {
               </div>
             )}
             
-            {/* Recordings */}
+            {/* Legacy Recordings (keeping for backward compatibility if needed) */}
             {selectedDateDetails.recordings && selectedDateDetails.recordings.length > 0 && (
               <div>
                 <h3 className="text-sm font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
@@ -2386,6 +2562,69 @@ function App() {
         }
       })
     })
+  }
+
+  const ProfileDialog = () => {
+    if (!showProfileDialog || !user) return null
+
+    return (
+      <>
+        <div 
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[80]"
+          onClick={() => setShowProfileDialog(false)}
+        />
+        <div className="fixed bottom-4 left-4 z-[90] lg:left-20">
+          <div 
+            className="bg-white dark:bg-[#171717] rounded-2xl border border-slate-200 dark:border-white/10 shadow-2xl w-full max-w-sm p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-lg font-bold text-slate-800 dark:text-white">Profile</h3>
+              <button
+                onClick={() => setShowProfileDialog(false)}
+                className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors text-slate-400 hover:text-slate-600 dark:hover:text-white"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            
+            <div className="flex items-center gap-4 mb-6">
+              {user.photoURL && !imageError.has('profile') ? (
+                <img 
+                  src={user.photoURL} 
+                  alt={user.displayName || user.email} 
+                  className="w-16 h-16 rounded-full flex-shrink-0 object-cover border-2 border-slate-200 dark:border-white/10" 
+                  onError={() => setImageError(prev => new Set(prev).add('profile'))} 
+                />
+              ) : (
+                <div className="w-16 h-16 rounded-full bg-indigo-500 flex items-center justify-center text-lg text-white font-bold flex-shrink-0 border-2 border-slate-200 dark:border-white/10">
+                  {getUserInitials(user)}
+                </div>
+              )}
+              <div className="flex-1 min-w-0">
+                <p className="text-base font-semibold dark:text-white truncate">{user.displayName || user.email}</p>
+                <p className="text-sm text-slate-500 dark:text-slate-400 truncate">{user.email}</p>
+                <span className="inline-block mt-1 text-xs text-[#10a37f] font-semibold">Pro Plan</span>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <button 
+                onClick={handleSignOut} 
+                className="w-full flex items-center justify-center gap-2 px-4 py-3 text-sm text-white bg-red-500 hover:bg-red-600 rounded-xl transition-all font-semibold"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                </svg>
+                <span>Sign Out</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </>
+    )
   }
 
   const ConfirmationModal = () => {
@@ -2629,6 +2868,9 @@ function App() {
         <LoginModal />
         <SearchModal />
         <ConfirmationModal />
+        <ProfileDialog />
+        <ConfirmationModal />
+        <ProfileDialog />
         <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
           <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
@@ -2683,7 +2925,18 @@ function App() {
               </div>
             </header>
 
-            <div className="flex-1 overflow-y-auto custom-scrollbar">
+            <div className="flex-1 overflow-y-auto custom-scrollbar relative">
+              {loadingMemory && (
+                <div className="absolute inset-0 bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-sm z-10 flex items-center justify-center">
+                  <div className="text-center">
+                    <div className="relative w-16 h-16 mx-auto mb-4">
+                      <div className="absolute inset-0 border-4 border-[#10a37f]/20 rounded-full"></div>
+                      <div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-full animate-spin"></div>
+                    </div>
+                    <p className="text-slate-600 dark:text-slate-300 font-medium">Loading memory details...</p>
+                  </div>
+                </div>
+              )}
               <div className="max-w-7xl mx-auto p-6 lg:p-8">
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                   {/* Transcription - Left/Center (takes 2 columns on large screens) */}
@@ -2974,6 +3227,28 @@ function App() {
                               </div>
                             </div>
                           )}
+                          {(selectedMemory.conversation_id || selectedMemory.conversationId) && (
+                            <div className="pt-2">
+                              <button
+                                onClick={() => {
+                                  const convId = selectedMemory.conversation_id || selectedMemory.conversationId
+                                  navigate(`/conversation/${convId}`)
+                                  setCurrentScreen(SCREENS.MAIN)
+                                  setSelectedMemory(null)
+                                  setIsPlaying(false)
+                                  setActiveUtteranceIndex(null)
+                                  setCurrentPlaybackTime(0)
+                                  setAudioUrl(null)
+                                }}
+                                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-[#10a37f] text-white rounded-lg hover:bg-[#1a7f64] transition-colors font-semibold text-sm"
+                              >
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                                </svg>
+                                View Chat
+                              </button>
+                            </div>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -2996,6 +3271,9 @@ function App() {
         <LoginModal />
         <SearchModal />
         <ConfirmationModal />
+        <ProfileDialog />
+        <ConfirmationModal />
+        <ProfileDialog />
         <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
           <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
@@ -3230,6 +3508,9 @@ function App() {
         <LoginModal />
         <SearchModal />
         <ConfirmationModal />
+        <ProfileDialog />
+        <ConfirmationModal />
+        <ProfileDialog />
         {showTagModal && (
           <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
             <div className="bg-white dark:bg-[#171717] rounded-2xl p-6 max-w-md w-full shadow-2xl border border-slate-200 dark:border-white/10">
@@ -4304,6 +4585,9 @@ function App() {
         <LoginModal />
         <SearchModal />
         <ConfirmationModal />
+        <ProfileDialog />
+        <ConfirmationModal />
+        <ProfileDialog />
         {showTagModal && (
           <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
             <div className="bg-white dark:bg-[#171717] rounded-2xl p-6 max-w-md w-full shadow-2xl border border-slate-200 dark:border-white/10">
@@ -4588,27 +4872,83 @@ function App() {
         <LoginModal />
         <SearchModal />
         <ConfirmationModal />
+        <ProfileDialog />
+        <ConfirmationModal />
+        <ProfileDialog />
         <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
           <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
             {headerJSX}
             <div className="flex-1 overflow-y-auto px-4 lg:px-8 custom-scrollbar">
               <div className="max-w-3xl mx-auto py-8 lg:py-12 pb-24">
-                {messages.length === 0 && (
+                {messages.length === 0 && !loadingConversation && (
                   <div className="text-center py-16 lg:py-24 px-4">
                     <div className="w-20 h-20 lg:w-24 lg:h-24 bg-[#10a37f]/10 rounded-2xl lg:rounded-3xl flex items-center justify-center mx-auto mb-8 text-3xl lg:text-4xl">🎙️</div>
-                    {memories.length === 0 ? (
+                    {memoriesLoading || authLoading ? (
+                      <div className="flex items-center justify-center gap-2">
+                        <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                        <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                        <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                      </div>
+                    ) : memories.length === 0 ? (
                       <>
                         <h3 className="text-2xl lg:text-3xl font-bold mb-4 dark:text-white">Hi, I'm here to help you reflect, one day at a time.</h3>
                         <p className="text-sm lg:text-base text-slate-500 dark:text-slate-400 max-w-md mx-auto leading-relaxed">We'll start with a simple check-in, and over time I'll help summarize how you've been feeling.</p>
-                        <p className="text-sm lg:text-base text-slate-500 dark:text-slate-400 max-w-md mx-auto mt-4 font-semibold">Ready to begin?</p>
+                        <p className="text-sm lg:text-base text-slate-500 dark:text-slate-400 max-w-md mx-auto mt-4 font-semibold mb-8">Ready to begin?</p>
+                        <div className="flex flex-wrap items-center justify-center gap-3 max-w-2xl mx-auto">
+                          <button
+                            onClick={() => setInputQuery("How can I start reflecting today?")}
+                            className="px-4 py-2.5 bg-white/5 dark:bg-white/5 border border-slate-200/50 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-white/10 dark:hover:bg-white/10 transition-all text-sm font-medium"
+                          >
+                            How can I start reflecting today?
+                          </button>
+                          <button
+                            onClick={() => setInputQuery("What should I focus on this week?")}
+                            className="px-4 py-2.5 bg-white/5 dark:bg-white/5 border border-slate-200/50 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-white/10 dark:hover:bg-white/10 transition-all text-sm font-medium"
+                          >
+                            What should I focus on this week?
+                          </button>
+                        </div>
                       </>
                     ) : (
                       <>
                         <h3 className="text-2xl lg:text-3xl font-bold mb-4 dark:text-white">I'm here.</h3>
-                        <p className="text-sm lg:text-base text-slate-500 dark:text-slate-400 max-w-md mx-auto leading-relaxed">Would you like to check in again, or look back at recent patterns?</p>
+                        <p className="text-sm lg:text-base text-slate-500 dark:text-slate-400 max-w-md mx-auto leading-relaxed mb-8">Would you like to check in again, or look back at recent patterns?</p>
+                        <div className="flex flex-wrap items-center justify-center gap-3 max-w-2xl mx-auto">
+                          <button
+                            onClick={() => setInputQuery("Summarize my recent memories")}
+                            className="px-4 py-2.5 bg-white/5 dark:bg-white/5 border border-slate-200/50 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-white/10 dark:hover:bg-white/10 transition-all text-sm font-medium"
+                          >
+                            Summarize my recent memories
+                          </button>
+                          <button
+                            onClick={() => setInputQuery("What patterns do you notice in my reflections?")}
+                            className="px-4 py-2.5 bg-white/5 dark:bg-white/5 border border-slate-200/50 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-white/10 dark:hover:bg-white/10 transition-all text-sm font-medium"
+                          >
+                            What patterns do you notice?
+                          </button>
+                          <button
+                            onClick={() => setInputQuery("How have I been feeling lately?")}
+                            className="px-4 py-2.5 bg-white/5 dark:bg-white/5 border border-slate-200/50 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-white/10 dark:hover:bg-white/10 transition-all text-sm font-medium"
+                          >
+                            How have I been feeling lately?
+                          </button>
+                        </div>
                       </>
                     )}
+                  </div>
+                )}
+                {loadingConversation && messages.length === 0 && (
+                  <div className="text-center py-16 lg:py-24 px-4">
+                    <div className="w-20 h-20 lg:w-24 lg:h-24 bg-[#10a37f]/10 rounded-2xl lg:rounded-3xl flex items-center justify-center mx-auto mb-8 text-3xl lg:text-4xl">🎙️</div>
+                    <div className="flex flex-col items-center justify-center gap-3">
+                      <div className="flex items-center justify-center gap-2">
+                        <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                        <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                        <div className="w-2 h-2 bg-[#10a37f] rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                      </div>
+                      <p className="text-sm text-slate-500 dark:text-slate-400">Loading conversation...</p>
+                    </div>
                   </div>
                 )}
                 <div className="space-y-6">
@@ -4650,8 +4990,8 @@ function App() {
                             Create Memory
                           </div>
                           <button
-                            onClick={() => {
-                              if (requireAuth('record')) {
+                            onClick={async () => {
+                              if (await requireAuth('record')) {
                                 setCurrentScreen(SCREENS.RECORD)
                                 setShowCreateMemoryDropdown(false)
                               }
@@ -4670,8 +5010,8 @@ function App() {
                             </div>
                           </button>
                           <button
-                            onClick={() => {
-                              if (requireAuth('upload')) {
+                            onClick={async () => {
+                              if (await requireAuth('upload')) {
                                 fileInputRef.current.click()
                                 setShowCreateMemoryDropdown(false)
                               }
@@ -4689,8 +5029,8 @@ function App() {
                             </div>
                           </button>
                           <button
-                            onClick={() => {
-                              if (requireAuth('create text memory')) {
+                            onClick={async () => {
+                              if (await requireAuth('create text memory')) {
                                 setCurrentScreen(SCREENS.CREATE_TEXT_MEMORY)
                                 setShowCreateMemoryDropdown(false)
                               }
@@ -4761,6 +5101,9 @@ function App() {
         <LoginModal />
         <SearchModal />
         <ConfirmationModal />
+        <ProfileDialog />
+        <ConfirmationModal />
+        <ProfileDialog />
         <div className="h-screen flex bg-[#0d0d0d] text-white overflow-hidden">
           <main className="flex-1 flex flex-col items-center justify-center p-6 relative">
             <button onClick={cancelRecording} className="absolute top-8 left-8 p-3 hover:bg-white/10 rounded-2xl transition-all active:scale-90"><svg className="w-6 h-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
@@ -4783,6 +5126,9 @@ function App() {
         <LoginModal />
         <SearchModal />
         <ConfirmationModal />
+        <ProfileDialog />
+        <ConfirmationModal />
+        <ProfileDialog />
         <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
           <div className="flex-1 flex flex-col min-w-0">
@@ -4802,6 +5148,9 @@ function App() {
         <LoginModal />
         <SearchModal />
         <ConfirmationModal />
+        <ProfileDialog />
+        <ConfirmationModal />
+        <ProfileDialog />
         <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden">
           <div className="text-center max-w-xs animate-fade-in"><div className="relative w-24 h-24 mx-auto mb-10"><div className="absolute inset-0 border-4 border-[#10a37f]/10 rounded-[2rem]"></div><div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-[2rem] animate-spin"></div><div className="absolute inset-0 flex items-center justify-center"><svg className="w-8 h-8 text-[#10a37f] animate-pulse" fill="currentColor" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z" /></svg></div></div><h2 className="text-2xl font-bold mb-3 tracking-tight dark:text-white">Expanding Intelligence</h2><p className="text-xs text-slate-500 font-bold uppercase tracking-[0.2em] mb-8">{processStatus === PROCESS_STATUS.UPLOADING && 'Uploading to cloud...'}{processStatus === PROCESS_STATUS.TRANSCRIBING && 'Analyzing voice patterns...'}{processStatus === PROCESS_STATUS.INDEXING && 'Grounding global memory...'}{processStatus === PROCESS_STATUS.READY && 'Ready!'}</p><div className="w-full bg-slate-100 dark:bg-white/5 h-1.5 rounded-full overflow-hidden"><div className="h-full bg-[#10a37f] transition-all duration-500" style={{ width: processStatus === PROCESS_STATUS.UPLOADING ? '30%' : processStatus === PROCESS_STATUS.TRANSCRIBING ? '60%' : '90%' }}></div></div></div>
         </div>
@@ -4832,6 +5181,16 @@ function App() {
   }
 
   return null
+}
+
+// Main App component with routing
+function App() {
+  return (
+    <Routes>
+      <Route path="/conversation/:conversationId" element={<AppContent />} />
+      <Route path="*" element={<AppContent />} />
+    </Routes>
+  )
 }
 
 export default App

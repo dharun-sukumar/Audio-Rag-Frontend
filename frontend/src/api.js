@@ -1,7 +1,7 @@
 import { auth } from './firebase';
 import { getIdToken } from 'firebase/auth';
 
-const API_BASE_URL = 'http://38.242.215.255:8000';
+const API_BASE_URL = 'https://transcribe.alterwork.in/api';
 
 async function getAuthToken(forceRefresh = false) {
   const user = auth.currentUser;
