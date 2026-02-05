@@ -1,6 +1,13 @@
 #root {
   width: 100%;
+  height: 100vh; /* Fallback for browsers that don't support dvh */
+  height: 100dvh; /* Use dynamic viewport height for mobile browsers - adjusts when address bar appears/disappears */
+}
+
+/* Ensure body and html also use dynamic viewport height */
+html {
   height: 100vh;
+  height: 100dvh;
 }
 
 .logo {
@@ -113,4 +120,44 @@ input[type="range"].slider:focus::-webkit-slider-thumb {
 
 input[type="range"].slider:focus::-moz-range-thumb {
   box-shadow: 0 0 0 3px rgba(16, 163, 127, 0.2);
+}
+
+/* Mobile floating player slider */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #10a37f;
+  cursor: pointer;
+  border: 2px solid white;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: all 0.2s ease;
+}
+
+input[type="range"]::-webkit-slider-thumb:active {
+  transform: scale(1.2);
+  box-shadow: 0 3px 6px rgba(16, 163, 127, 0.4);
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #10a37f;
+  cursor: pointer;
+  border: 2px solid white;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+  transition: all 0.2s ease;
+}
+
+input[type="range"]::-moz-range-thumb:active {
+  transform: scale(1.2);
+  box-shadow: 0 3px 6px rgba(16, 163, 127, 0.4);
 }

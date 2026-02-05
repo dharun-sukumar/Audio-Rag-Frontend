@@ -148,6 +148,8 @@ function AppContent() {
   const dataArrayRef = useRef(null)
   const authLoadingRef = useRef(true)
   const userRef = useRef(null)
+  // When we create a conversation from the first message, skip the route effect loading it (we handle messages in askQuestion)
+  const skipLoadForConversationIdRef = useRef(null)
   
 
   // Audio playback state
@@ -508,24 +510,13 @@ function AppContent() {
     }
   }
 
-  // Create a new conversation or navigate to existing empty one
-  const createNewConversation = async () => {
-    if (!(await requireAuth('create conversation'))) return false
-    
+  // Get or create a conversation id without navigating. Used when sending the first message so we can set the user message in state before navigating (avoids AI showing before user).
+  const getOrCreateConversationIdForFirstMessage = async () => {
+    if (!(await requireAuth('create conversation'))) return null
     try {
-      // First, check if current conversation is already empty
-      if (currentConversationId && messages.length === 0) {
-        // Already in an empty conversation, just ensure we're on the right screen
-        setCurrentScreen(SCREENS.MAIN)
-        navigate(`/conversation/${currentConversationId}`)
-        return true
-      }
-      
-      // Find empty conversations (message_count === 0 or null/undefined)
-      // Filter and get the most recent one in a single pass for efficiency
+      if (currentConversationId && messages.length === 0) return currentConversationId
       let mostRecentEmpty = null
       let mostRecentDate = 0
-      
       for (const conv of conversations) {
         const messageCount = conv.message_count ?? 0
         if (messageCount === 0) {
@@ -536,42 +527,57 @@ function AppContent() {
           }
         }
       }
-      
-      // If we found an empty conversation, navigate to it
-      if (mostRecentEmpty) {
-        console.log('Found existing empty conversation, navigating to it:', mostRecentEmpty.id)
-        // Just navigate - loadConversationById will handle the rest via useEffect
-        navigate(`/conversation/${mostRecentEmpty.id}`)
-        return true
-      }
-      
-      // No empty conversation found, create a new one
-      console.log('Creating new conversation...')
+      if (mostRecentEmpty) return mostRecentEmpty.id
       const conversation = await api.createConversation('New Chat')
-      console.log('Conversation created:', conversation)
-      
-      // Optimistically add to list (will be refreshed by fetchConversations)
       setConversations(prev => [conversation, ...prev])
-      
-      // Navigate to the new conversation route
-      // The useEffect will handle loading the conversation
-      navigate(`/conversation/${conversation.id}`)
-      
-      // Refresh conversations list in background (to get accurate counts)
-      fetchConversations().catch(err => {
-        console.error('Error refreshing conversations:', err)
-      })
-      
-      if (showCalendarDropdown) {
-        fetchCalendarData(calendarDate)
-      }
-      
-      return true
+      fetchConversations().catch(err => console.error('Error refreshing conversations:', err))
+      if (showCalendarDropdown) fetchCalendarData(calendarDate)
+      return conversation.id
     } catch (err) {
       console.error('Failed to create conversation:', err)
       setErrorMessage(`Failed to create conversation: ${err.message}`)
       showToast('Failed to create conversation', 'error')
-      return false
+      return null
+    }
+  }
+
+  // Create a new conversation or navigate to existing empty one.
+  // Returns the conversation id to use, or null on failure.
+  const createNewConversation = async () => {
+    if (!(await requireAuth('create conversation'))) return null
+    try {
+      if (currentConversationId && messages.length === 0) {
+        setCurrentScreen(SCREENS.MAIN)
+        navigate(`/conversation/${currentConversationId}`)
+        return currentConversationId
+      }
+      let mostRecentEmpty = null
+      let mostRecentDate = 0
+      for (const conv of conversations) {
+        const messageCount = conv.message_count ?? 0
+        if (messageCount === 0) {
+          const createdDate = new Date(conv.created_at || 0).getTime()
+          if (createdDate > mostRecentDate) {
+            mostRecentDate = createdDate
+            mostRecentEmpty = conv
+          }
+        }
+      }
+      if (mostRecentEmpty) {
+        navigate(`/conversation/${mostRecentEmpty.id}`)
+        return mostRecentEmpty.id
+      }
+      const conversation = await api.createConversation('New Chat')
+      setConversations(prev => [conversation, ...prev])
+      navigate(`/conversation/${conversation.id}`)
+      fetchConversations().catch(err => console.error('Error refreshing conversations:', err))
+      if (showCalendarDropdown) fetchCalendarData(calendarDate)
+      return conversation.id
+    } catch (err) {
+      console.error('Failed to create conversation:', err)
+      setErrorMessage(`Failed to create conversation: ${err.message}`)
+      showToast('Failed to create conversation', 'error')
+      return null
     }
   }
 
@@ -732,15 +738,24 @@ function AppContent() {
       const messages = await api.getConversationMessages(conversationId, 0, 100)
       console.log('Messages fetched:', messages)
       
-      // Messages are already in the correct format from the API
-      setMessages(messages || [])
+      // Don't overwrite messages if we're in the middle of sending the first message (askQuestion owns the state)
+      if (skipLoadForConversationIdRef.current) {
+        console.log('Skipping setMessages in loadConversationById (first-message flow active)')
+      } else {
+        // Ensure chronological order (backend may return newest first)
+        const list = messages || []
+        const sorted = list.length && (list[0].created_at ?? list[0].id)
+          ? [...list].sort((a, b) => new Date(a.created_at || a.id || 0) - new Date(b.created_at || b.id || 0))
+          : list
+        setMessages(sorted)
+      }
       
       if (window.innerWidth < 1024) setSidebarOpen(false)
     } catch (err) {
       console.error('Failed to load conversation:', err)
       setErrorMessage(`Failed to load conversation: ${err.message}`)
-      // Clear messages on error
-      setMessages([])
+      // Clear messages on error (unless we're in first-message flow)
+      if (!skipLoadForConversationIdRef.current) setMessages([])
     } finally {
       setLoadingConversation(false)
     }
@@ -751,6 +766,8 @@ function AppContent() {
     if (!user) return
     
     if (conversationId) {
+      // Skip if we're in the middle of creating/sending first message (askQuestion owns the state; ref is true or the new id)
+      if (skipLoadForConversationIdRef.current) return
       // Only load if it's different from current conversation
       if (conversationId !== currentConversationId) {
         // Wait for conversations to load if not available yet
@@ -770,7 +787,8 @@ function AppContent() {
         }
       }
     } else if (!conversationId && currentConversationId) {
-      // URL doesn't have conversationId but we have one loaded - clear it
+      // URL doesn't have conversationId but we have one loaded - clear it (unless we're sending first message from clean chat)
+      if (skipLoadForConversationIdRef.current) return
       setCurrentConversationId(null)
       setMessages([])
     }
@@ -1020,30 +1038,47 @@ function AppContent() {
 
   const handleFileSelect = async (e) => {
     const file = e.target.files[0]
-    if (file && (file.type.startsWith('audio/') || file.type.startsWith('video/'))) {
-      if (!(await requireAuth('upload'))) {
-        e.target.value = '' 
-        return
-      }
-      setSelectedFile(file)
-      setRecordingName(`${file.name.replace(/\.[^/.]+$/, '')}`)
-      
-      const url = URL.createObjectURL(file)
-      const media = document.createElement(file.type.startsWith('video/') ? 'video' : 'audio')
-      media.src = url
-      media.onloadedmetadata = () => {
-        setSavedRecordingDuration(Math.floor(media.duration))
-        URL.revokeObjectURL(url)
-      }
-      media.onerror = () => {
-        setSavedRecordingDuration(0)
-        URL.revokeObjectURL(url)
-      }
-      
-      setCurrentScreen(SCREENS.REVIEW)
-    } else if (file) {
+    if (!file) return
+    
+    // Check file type
+    if (!(file.type.startsWith('audio/') || file.type.startsWith('video/'))) {
       setErrorMessage('Please select an audio or video file.')
+      e.target.value = ''
+      return
     }
+    
+    // Check file size (400MB limit)
+    const MAX_FILE_SIZE = 400 * 1024 * 1024; // 400MB in bytes
+    if (file.size > MAX_FILE_SIZE) {
+      const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
+      setErrorMessage(`File size (${fileSizeMB} MB) exceeds the maximum allowed size of 400 MB. Please choose a smaller file.`);
+      showToast(`File too large (${fileSizeMB} MB). Maximum size is 400 MB.`, 'error');
+      e.target.value = ''
+      return
+    }
+    
+    if (!(await requireAuth('upload'))) {
+      e.target.value = '' 
+      return
+    }
+    
+    setSelectedFile(file)
+    setRecordingName(`${file.name.replace(/\.[^/.]+$/, '')}`)
+    setErrorMessage('') // Clear any previous errors
+    
+    const url = URL.createObjectURL(file)
+    const media = document.createElement(file.type.startsWith('video/') ? 'video' : 'audio')
+    media.src = url
+    media.onloadedmetadata = () => {
+      setSavedRecordingDuration(Math.floor(media.duration))
+      URL.revokeObjectURL(url)
+    }
+    media.onerror = () => {
+      setSavedRecordingDuration(0)
+      URL.revokeObjectURL(url)
+    }
+    
+    setCurrentScreen(SCREENS.REVIEW)
   }
 
   const startRecording = async () => {
@@ -1583,18 +1618,31 @@ function AppContent() {
     if (!inputQuery.trim()) return
     if (!(await requireAuth('ask'))) return
     
-    // Create a conversation if one doesn't exist
-    if (!currentConversationId) {
+    // Resolve conversation id: use current or create (without navigating) so we can set user message before navigation
+    let conversationIdToUse = currentConversationId
+    if (!conversationIdToUse) {
       console.log('No conversation exists, creating one...')
-      const created = await createNewConversation()
-      if (!created) {
+      const createdId = await getOrCreateConversationIdForFirstMessage()
+      if (!createdId) {
         console.error('Failed to create conversation, aborting question')
         return
       }
+      conversationIdToUse = createdId
+      // Prevent the route effect from clearing messages when we're on "/" with a conversation set (first-message flow)
+      skipLoadForConversationIdRef.current = createdId
+      // Set user message and conversation in state BEFORE navigating so the conversation never shows empty (user always appears first)
+      const userMsg = { role: 'user', content: inputQuery }
+      setCurrentConversationId(createdId)
+      setMessages([userMsg])
+      setCurrentScreen(SCREENS.MAIN)
+      navigate(`/conversation/${createdId}`)
     }
     
     const userMsg = { role: 'user', content: inputQuery }
-    setMessages(prev => [...prev, userMsg])
+    if (conversationIdToUse === currentConversationId) {
+      // We're in an existing conversation: append user message to list
+      setMessages(prev => [...prev, userMsg])
+    }
     const currentQuery = inputQuery
     setInputQuery('')
     setIsThinking(true)
@@ -1602,16 +1650,16 @@ function AppContent() {
     
     try {
       // Save user message to conversation
-      console.log('Saving user message to conversation:', currentConversationId)
-      await api.addMessageToConversation(currentConversationId, 'user', currentQuery)
+      console.log('Saving user message to conversation:', conversationIdToUse)
+      await api.addMessageToConversation(conversationIdToUse, 'user', currentQuery)
       
       // Get AI response
       const data = await api.askQuestion(currentQuery)
       const answer = data.answer || data
       
       // Save assistant response to conversation
-      console.log('Saving assistant response to conversation:', currentConversationId)
-      await api.addMessageToConversation(currentConversationId, 'assistant', answer)
+      console.log('Saving assistant response to conversation:', conversationIdToUse)
+      await api.addMessageToConversation(conversationIdToUse, 'assistant', answer)
       
       setMessages(prev => [...prev, { role: 'assistant', content: answer, sources: [] }])
       
@@ -1622,6 +1670,7 @@ function AppContent() {
       setErrorMessage('Error getting response.')
     } finally {
       setIsThinking(false)
+      skipLoadForConversationIdRef.current = null
     }
   }
 
@@ -2010,7 +2059,7 @@ function AppContent() {
         />
       )}
       <aside className={`
-        fixed lg:sticky top-0 left-0 h-screen
+        fixed lg:sticky top-0 left-0 h-[100dvh]
         ${sidebarOpen ? 'w-72 translate-x-0' : 'w-72 -translate-x-full lg:w-20 lg:translate-x-0'} 
         bg-[#f9f9f9] dark:bg-[#171717] border-r border-slate-200 dark:border-white/10 
         transition-all duration-300 ease-out z-[70] flex flex-col flex-shrink-0
@@ -2871,9 +2920,9 @@ function AppContent() {
         <ProfileDialog />
         <ConfirmationModal />
         <ProfileDialog />
-        <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
+        <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
-          <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
+          <div className="flex-1 flex flex-col min-w-0 h-[100dvh] overflow-hidden">
             <header className="h-14 lg:h-16 border-b border-slate-200 dark:border-white/10 px-4 lg:px-6 flex items-center justify-between bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl">
               <div className="flex items-center gap-3">
                 <button 
@@ -2925,7 +2974,7 @@ function AppContent() {
               </div>
             </header>
 
-            <div className="flex-1 overflow-y-auto custom-scrollbar relative">
+            <div className="flex-1 overflow-y-auto custom-scrollbar relative pb-24 lg:pb-0">
               {loadingMemory && (
                 <div className="absolute inset-0 bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-sm z-10 flex items-center justify-center">
                   <div className="text-center">
@@ -2937,28 +2986,28 @@ function AppContent() {
                   </div>
                 </div>
               )}
-              <div className="max-w-7xl mx-auto p-6 lg:p-8">
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              <div className="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6">
                   {/* Transcription - Left/Center (takes 2 columns on large screens) */}
-                  <div className="lg:col-span-2 bg-white dark:bg-[#171717] rounded-2xl border border-slate-200 dark:border-white/10 overflow-hidden order-2 lg:order-1">
-                    <div className="p-6 border-b border-slate-200 dark:border-white/10">
-                      <h2 className="text-lg font-bold text-slate-800 dark:text-white flex items-center gap-2">
-                        <svg className="w-5 h-5 text-[#10a37f]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <div className="lg:col-span-2 bg-white dark:bg-[#171717] rounded-xl sm:rounded-2xl border border-slate-200 dark:border-white/10 overflow-hidden order-2 lg:order-1 mb-6 lg:mb-0">
+                    <div className="p-4 sm:p-6 border-b border-slate-200 dark:border-white/10">
+                      <h2 className="text-base sm:text-lg font-bold text-slate-800 dark:text-white flex items-center gap-2 flex-wrap">
+                        <svg className="w-4 h-4 sm:w-5 sm:h-5 text-[#10a37f]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                         </svg>
                         {selectedMemory.media_type === 'text' ? 'Content' : 'Transcription'}
                         {selectedMemoryTranscript && typeof selectedMemoryTranscript === 'object' && selectedMemoryTranscript.utterances && (
-                          <span className="text-sm font-normal text-slate-500 dark:text-slate-400">
+                          <span className="text-xs sm:text-sm font-normal text-slate-500 dark:text-slate-400">
                             ({selectedMemoryTranscript.utterances.length} {selectedMemoryTranscript.utterances.length === 1 ? 'segment' : 'segments'})
                           </span>
                         )}
                         {selectedMemoryTranscript && Array.isArray(selectedMemoryTranscript) && (
-                          <span className="text-sm font-normal text-slate-500 dark:text-slate-400">
+                          <span className="text-xs sm:text-sm font-normal text-slate-500 dark:text-slate-400">
                             ({selectedMemoryTranscript.length} {selectedMemoryTranscript.length === 1 ? 'segment' : 'segments'})
                           </span>
                         )}
                       </h2>
-                      <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+                      <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-1">
                         {selectedMemory.media_type === 'text' 
                           ? (selectedMemory.status === 'completed' ? 'Text content of the memory' : 'Text content will be available after processing')
                           : (selectedMemory.status === 'completed' ? 'Full transcript of the recording' : 'Transcription will be available after processing')
@@ -2966,7 +3015,7 @@ function AppContent() {
                       </p>
                     </div>
                   
-                    <div className="p-6 space-y-4 max-h-[600px] overflow-y-auto custom-scrollbar">
+                    <div className="p-4 sm:p-6 pb-8 lg:pb-6 space-y-3 sm:space-y-4 max-h-[500px] sm:max-h-[600px] overflow-y-auto custom-scrollbar">
                       {loadingTranscript ? (
                         <div className="text-center py-12">
                           <div className="relative w-16 h-16 mx-auto mb-6">
@@ -2994,19 +3043,19 @@ function AppContent() {
                               key={idx} 
                               ref={activeUtteranceIndex === idx ? activeUtteranceRef : null}
                               onClick={() => segment.start && seekToTime(segment.start)}
-                              className={`p-4 rounded-xl border transition-all cursor-pointer ${
+                              className={`p-3 sm:p-4 rounded-lg sm:rounded-xl border transition-all cursor-pointer ${
                                 activeUtteranceIndex === idx
-                                  ? 'bg-[#10a37f]/10 border-[#10a37f] shadow-lg scale-[1.02]'
-                                  : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/10'
+                                  ? 'bg-[#10a37f]/10 border-[#10a37f] shadow-lg scale-[1.01] sm:scale-[1.02]'
+                                  : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/10 active:bg-slate-100 dark:active:bg-white/10'
                               }`}
                             >
                               {segment.speaker && (
-                                <p className="text-xs font-bold text-[#10a37f] mb-2">{segment.speaker}</p>
+                                <p className="text-[10px] sm:text-xs font-bold text-[#10a37f] mb-1.5 sm:mb-2">{segment.speaker}</p>
                               )}
                               {segment.timestamp && (
-                                <p className="text-xs text-slate-500 mb-2">{segment.timestamp}</p>
+                                <p className="text-[10px] sm:text-xs text-slate-500 mb-1.5 sm:mb-2">{segment.timestamp}</p>
                               )}
-                              <p className={`text-sm leading-relaxed ${
+                              <p className={`text-xs sm:text-sm leading-relaxed ${
                                 activeUtteranceIndex === idx
                                   ? 'text-slate-900 dark:text-white font-medium'
                                   : 'text-slate-700 dark:text-slate-300'
@@ -3019,24 +3068,24 @@ function AppContent() {
                               key={idx} 
                               ref={activeUtteranceIndex === idx ? activeUtteranceRef : null}
                               onClick={() => utterance.start && seekToTime(utterance.start)}
-                              className={`p-4 rounded-xl border transition-all duration-200 cursor-pointer ${
+                              className={`p-3 sm:p-4 rounded-lg sm:rounded-xl border transition-all duration-200 cursor-pointer ${
                                 activeUtteranceIndex === idx
-                                  ? 'bg-[#10a37f]/10 border-[#10a37f] shadow-lg scale-[1.02]'
-                                  : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/10'
+                                  ? 'bg-[#10a37f]/10 border-[#10a37f] shadow-lg scale-[1.01] sm:scale-[1.02]'
+                                  : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/10 active:bg-slate-100 dark:active:bg-white/10'
                               }`}
                             >
                               {utterance.speaker && (
-                                <p className="text-xs font-bold text-[#10a37f] mb-2">Speaker {utterance.speaker}</p>
+                                <p className="text-[10px] sm:text-xs font-bold text-[#10a37f] mb-1.5 sm:mb-2">Speaker {utterance.speaker}</p>
                               )}
                               {utterance.start && (
-                                <p className="text-xs text-slate-500 dark:text-slate-400 mb-2 flex items-center gap-1">
-                                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                <p className="text-[10px] sm:text-xs text-slate-500 dark:text-slate-400 mb-1.5 sm:mb-2 flex items-center gap-1">
+                                  <svg className="w-2.5 h-2.5 sm:w-3 sm:h-3" fill="currentColor" viewBox="0 0 24 24">
                                     <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
                                   </svg>
                                   {formatTime(utterance.start / 1000)}
                                 </p>
                               )}
-                              <p className={`text-sm leading-relaxed ${
+                              <p className={`text-xs sm:text-sm leading-relaxed ${
                                 activeUtteranceIndex === idx
                                   ? 'text-slate-900 dark:text-white font-medium'
                                   : 'text-slate-700 dark:text-slate-300'
@@ -3059,17 +3108,17 @@ function AppContent() {
                     </div>
                   </div>
 
-                  {/* Audio Player - Right Side (takes 1 column on large screens) */}
+                  {/* Audio Player - Right Side (takes 1 column on large screens) - Hidden on mobile */}
                   {(selectedMemory.media_type === 'audio' || selectedMemory.media_type === 'video') && (
-                    <div className="lg:col-span-1 order-1 lg:order-2">
-                      <div className="bg-gradient-to-br from-[#10a37f]/10 to-[#10a37f]/5 dark:from-[#10a37f]/20 dark:to-[#10a37f]/10 rounded-2xl p-6 border border-[#10a37f]/20 sticky top-6">
-                        <div className="text-center mb-6">
-                          <div className="w-16 h-16 bg-[#10a37f] rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg">
-                            <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <div className="hidden lg:block lg:col-span-1 order-1 lg:order-2">
+                      <div className="bg-gradient-to-br from-[#10a37f]/10 to-[#10a37f]/5 dark:from-[#10a37f]/20 dark:to-[#10a37f]/10 rounded-xl sm:rounded-2xl p-4 sm:p-6 border border-[#10a37f]/20 lg:sticky lg:top-6">
+                        <div className="text-center mb-4 sm:mb-6">
+                          <div className="w-12 h-12 sm:w-16 sm:h-16 bg-[#10a37f] rounded-xl sm:rounded-2xl flex items-center justify-center mx-auto mb-3 sm:mb-4 shadow-lg">
+                            <svg className="w-6 h-6 sm:w-8 sm:h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
                             </svg>
                           </div>
-                          <h3 className="text-lg font-bold text-slate-800 dark:text-white mb-1">Audio Player</h3>
+                          <h3 className="text-base sm:text-lg font-bold text-slate-800 dark:text-white mb-1">Audio Player</h3>
                           <p className="text-xs text-slate-600 dark:text-slate-400">
                             {audioUrl ? 'Ready to play' : 'Audio loading...'}
                           </p>
@@ -3080,19 +3129,19 @@ function AppContent() {
                             {/* Audio Player with Waveform */}
                             <div className="mb-4">
                               <div className="flex items-center justify-between mb-3">
-                                <div className="flex items-center gap-3 flex-1 min-w-0">
-                                  <div className="w-10 h-10 bg-[#10a37f]/10 text-[#10a37f] rounded-lg flex items-center justify-center flex-shrink-0">
-                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <div className="flex items-center gap-2 sm:gap-3 flex-1 min-w-0">
+                                  <div className="w-8 h-8 sm:w-10 sm:h-10 bg-[#10a37f]/10 text-[#10a37f] rounded-lg flex items-center justify-center flex-shrink-0">
+                                    <svg className="w-4 h-4 sm:w-5 sm:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                                     </svg>
                                   </div>
                                   <div className="min-w-0 flex-1">
-                                    <p className="text-sm font-bold dark:text-white truncate">{selectedMemory.title || 'Audio'}</p>
-                                    <p className="text-xs text-slate-500 font-semibold">{formatTime(audioDuration || 0)}</p>
+                                    <p className="text-xs sm:text-sm font-bold dark:text-white truncate">{selectedMemory.title || 'Audio'}</p>
+                                    <p className="text-[10px] sm:text-xs text-slate-500 font-semibold">{formatTime(audioDuration || 0)}</p>
                                   </div>
                                 </div>
-                                <button onClick={togglePlayback} className="p-2.5 text-white bg-[#10a37f] active:bg-[#1a7f64] rounded-lg transition-all active:scale-95 shadow-md shadow-[#10a37f]/20 flex-shrink-0 ml-2">
+                                <button onClick={togglePlayback} className="p-2 sm:p-2.5 text-white bg-[#10a37f] active:bg-[#1a7f64] rounded-lg transition-all active:scale-95 shadow-md shadow-[#10a37f]/20 flex-shrink-0 ml-2">
                                   {isPlaying ? (
                                     <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg>
                                   ) : (
@@ -3102,7 +3151,7 @@ function AppContent() {
                               </div>
                               
                               {/* Progress Slider */}
-                              <div className="mb-3 space-y-2">
+                              <div className="mb-3 space-y-1.5 sm:space-y-2">
                                 <div className="relative">
                                   <input
                                     type="range"
@@ -3110,7 +3159,7 @@ function AppContent() {
                                     max={audioDuration || 1}
                                     value={currentPlaybackTime || 0}
                                     onChange={handleSeek}
-                                    className="w-full h-2 bg-slate-200 dark:bg-white/10 rounded-full appearance-none cursor-pointer custom-range-slider"
+                                    className="w-full h-1.5 sm:h-2 bg-slate-200 dark:bg-white/10 rounded-full appearance-none cursor-pointer custom-range-slider"
                                   />
                                 </div>
                                 <div className="flex items-center justify-between">
@@ -3124,7 +3173,7 @@ function AppContent() {
                               </div>
                               
                               {/* Waveform Visualization */}
-                              <div className="flex items-end justify-center gap-0.5 h-10 mt-3">
+                              <div className="flex items-end justify-center gap-0.5 h-8 sm:h-10 mt-2 sm:mt-3">
                                 {waveformData.map((value, index) => (
                                   <div
                                     key={index}
@@ -3187,23 +3236,23 @@ function AppContent() {
                         )}
                         
                         {/* Memory Metadata */}
-                        <div className="mt-6 pt-6 border-t border-slate-200 dark:border-white/10 space-y-3">
+                        <div className="mt-4 sm:mt-6 pt-4 sm:pt-6 border-t border-slate-200 dark:border-white/10 space-y-2.5 sm:space-y-3">
                           {selectedMemory.topic && (
                             <div>
                               <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Topic</p>
-                              <p className="text-sm text-slate-700 dark:text-slate-300">{selectedMemory.topic}</p>
+                              <p className="text-xs sm:text-sm text-slate-700 dark:text-slate-300 break-words">{selectedMemory.topic}</p>
                             </div>
                           )}
                           {selectedMemory.mood && (
                             <div>
                               <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Mood</p>
-                              <p className="text-2xl">{['😢', '😕', '😐', '🙂', '😄'][selectedMemory.mood - 1]}</p>
+                              <p className="text-xl sm:text-2xl">{['😢', '😕', '😐', '🙂', '😄'][selectedMemory.mood - 1]}</p>
                             </div>
                           )}
                           {selectedMemory.people && selectedMemory.people.length > 0 && (
                             <div>
                               <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">People</p>
-                              <p className="text-sm text-slate-700 dark:text-slate-300">
+                              <p className="text-xs sm:text-sm text-slate-700 dark:text-slate-300 break-words">
                                 {Array.isArray(selectedMemory.people) ? selectedMemory.people.join(', ') : selectedMemory.people}
                               </p>
                             </div>
@@ -3211,11 +3260,11 @@ function AppContent() {
                           {selectedMemory.tags && selectedMemory.tags.length > 0 && (
                             <div>
                               <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Tags</p>
-                              <div className="flex flex-wrap gap-2">
+                              <div className="flex flex-wrap gap-1.5 sm:gap-2">
                                 {selectedMemory.tags.map(tag => (
                                   <span
                                     key={tag.id}
-                                    className="px-2 py-1 rounded-lg text-xs font-semibold"
+                                    className="px-2 py-0.5 sm:py-1 rounded-md sm:rounded-lg text-[10px] sm:text-xs font-semibold"
                                     style={{
                                       backgroundColor: tag.color + '20',
                                       color: tag.color
@@ -3240,9 +3289,9 @@ function AppContent() {
                                   setCurrentPlaybackTime(0)
                                   setAudioUrl(null)
                                 }}
-                                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-[#10a37f] text-white rounded-lg hover:bg-[#1a7f64] transition-colors font-semibold text-sm"
+                                className="w-full flex items-center justify-center gap-2 px-4 py-2 sm:py-2.5 bg-[#10a37f] text-white rounded-lg active:bg-[#1a7f64] transition-colors font-semibold text-xs sm:text-sm"
                               >
-                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <svg className="w-3.5 h-3.5 sm:w-4 sm:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
                                 </svg>
                                 View Chat
@@ -3256,6 +3305,114 @@ function AppContent() {
                 </div>
               </div>
             </div>
+
+            {/* Floating Spotify-style Audio Player - Mobile Only */}
+            {(selectedMemory.media_type === 'audio' || selectedMemory.media_type === 'video') && audioUrl && (
+              <div className="lg:hidden fixed bottom-0 left-0 right-0 z-50 bg-white/95 dark:bg-[#0d0d0d]/95 backdrop-blur-xl border-t border-slate-200 dark:border-white/10 shadow-[0_-4px_20px_rgba(0,0,0,0.1)] dark:shadow-[0_-4px_20px_rgba(0,0,0,0.3)] pb-safe-bottom">
+                <div className="px-3 py-2">
+                  {/* Metadata Section */}
+                  {(selectedMemory.topic || selectedMemory.mood || (selectedMemory.people && selectedMemory.people.length > 0) || (selectedMemory.tags && selectedMemory.tags.length > 0)) && (
+                    <div className="mb-2 pb-2 border-b border-slate-200/50 dark:border-white/10">
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                        {selectedMemory.topic && (
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">Topic</span>
+                            <span className="text-slate-700 dark:text-slate-300 font-medium">{selectedMemory.topic}</span>
+                          </div>
+                        )}
+                        {selectedMemory.mood && (
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">Mood</span>
+                            <span className="text-base">{['😢', '😕', '😐', '🙂', '😄'][selectedMemory.mood - 1]}</span>
+                          </div>
+                        )}
+                        {selectedMemory.people && selectedMemory.people.length > 0 && (
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">People</span>
+                            <span className="text-slate-700 dark:text-slate-300 font-medium truncate max-w-[120px]">
+                              {Array.isArray(selectedMemory.people) ? selectedMemory.people.join(', ') : selectedMemory.people}
+                            </span>
+                          </div>
+                        )}
+                        {selectedMemory.tags && selectedMemory.tags.length > 0 && (
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">Tags</span>
+                            <div className="flex items-center gap-1 flex-wrap">
+                              {selectedMemory.tags.slice(0, 3).map(tag => (
+                                <span
+                                  key={tag.id}
+                                  className="px-1.5 py-0.5 rounded text-[10px] font-semibold"
+                                  style={{
+                                    backgroundColor: tag.color + '20',
+                                    color: tag.color
+                                  }}
+                                >
+                                  {tag.name}
+                                </span>
+                              ))}
+                              {selectedMemory.tags.length > 3 && (
+                                <span className="text-slate-500 dark:text-slate-400 text-[10px]">+{selectedMemory.tags.length - 3}</span>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  
+                  {/* Progress Bar */}
+                  <div className="mb-2">
+                    <input
+                      type="range"
+                      min="0"
+                      max={audioDuration || 1}
+                      value={currentPlaybackTime || 0}
+                      onChange={handleSeek}
+                      className="w-full h-1 bg-slate-200 dark:bg-white/10 rounded-full appearance-none cursor-pointer slider"
+                      style={{
+                        background: `linear-gradient(to right, #10a37f 0%, #10a37f ${((currentPlaybackTime || 0) / (audioDuration || 1)) * 100}%, rgb(226 232 240) ${((currentPlaybackTime || 0) / (audioDuration || 1)) * 100}%, rgb(226 232 240) 100%)`
+                      }}
+                    />
+                  </div>
+                  
+                  {/* Player Controls */}
+                  <div className="flex items-center gap-3">
+                    {/* Thumbnail/Icon */}
+                    <div className="w-12 h-12 bg-[#10a37f] rounded-lg flex items-center justify-center flex-shrink-0 shadow-md">
+                      <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+                      </svg>
+                    </div>
+                    
+                    {/* Title and Info */}
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-semibold text-slate-800 dark:text-white truncate">
+                        {selectedMemory.title || 'Audio'}
+                      </p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        {formatTime(currentPlaybackTime)} / {formatTime(audioDuration || 0)}
+                      </p>
+                    </div>
+                    
+                    {/* Play/Pause Button */}
+                    <button 
+                      onClick={togglePlayback} 
+                      className="w-10 h-10 bg-[#10a37f] text-white rounded-full flex items-center justify-center flex-shrink-0 shadow-lg active:scale-95 transition-transform hover:bg-[#1a7f64]"
+                    >
+                      {isPlaying ? (
+                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                          <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/>
+                        </svg>
+                      ) : (
+                        <svg className="w-5 h-5 ml-0.5" fill="currentColor" viewBox="0 0 24 24">
+                          <path d="M8 5v14l11-7z"/>
+                        </svg>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </>
@@ -3274,9 +3431,9 @@ function AppContent() {
         <ProfileDialog />
         <ConfirmationModal />
         <ProfileDialog />
-        <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
+        <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
-          <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
+          <div className="flex-1 flex flex-col min-w-0 h-[100dvh] overflow-hidden">
             <header className="h-14 lg:h-16 border-b border-slate-200 dark:border-white/10 px-4 lg:px-6 flex items-center justify-between bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl">
               <div className="flex items-center gap-3">
                 <button onClick={() => { 
@@ -3973,7 +4130,7 @@ function AppContent() {
           </div>
         )}
         
-        <div className="h-screen bg-white dark:bg-[#0d0d0d] relative overflow-hidden md:flex md:items-center md:justify-center">
+        <div className="h-[100dvh] bg-white dark:bg-[#0d0d0d] relative overflow-hidden md:flex md:items-center md:justify-center">
           {audioUrl && (
             <audio 
               ref={audioPlayerRef} 
@@ -4265,7 +4422,7 @@ function AppContent() {
           </div>
 
           {/* Mobile: Full-screen scrollable layout */}
-          <div className="md:hidden h-screen flex flex-col bg-white dark:bg-[#0d0d0d] overflow-hidden">
+          <div className="md:hidden h-[100dvh] flex flex-col bg-white dark:bg-[#0d0d0d] overflow-hidden">
             {/* Header with close button */}
             <div className="flex items-center justify-between px-4 pt-safe-top pt-4 pb-3 border-b border-slate-200 dark:border-white/10 bg-white dark:bg-[#0d0d0d] z-10">
               <div>
@@ -4632,9 +4789,9 @@ function AppContent() {
           </div>
         )}
         
-        <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
+        <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
-          <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
+          <div className="flex-1 flex flex-col min-w-0 h-[100dvh] overflow-hidden">
             <header className="h-14 lg:h-16 border-b border-slate-200 dark:border-white/10 px-4 lg:px-6 flex items-center justify-between bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl">
               <div className="flex items-center gap-3">
                 <button 
@@ -4875,9 +5032,9 @@ function AppContent() {
         <ProfileDialog />
         <ConfirmationModal />
         <ProfileDialog />
-        <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
+        <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
-          <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
+          <div className="flex-1 flex flex-col min-w-0 h-[100dvh] overflow-hidden">
             {headerJSX}
             <div className="flex-1 overflow-y-auto px-4 lg:px-8 custom-scrollbar">
               <div className="max-w-3xl mx-auto py-8 lg:py-12 pb-24">
@@ -4964,7 +5121,7 @@ function AppContent() {
                 <div ref={chatEndRef} />
               </div>
             </div>
-            <div className="px-4 lg:px-8 pb-6 pt-2 bg-gradient-to-t from-white dark:from-[#0d0d0d] via-white/95 dark:via-[#0d0d0d]/95 to-transparent">
+            <div className="px-4 lg:px-8 pb-6 pb-safe-bottom pt-2 bg-gradient-to-t from-white dark:from-[#0d0d0d] via-white/95 dark:via-[#0d0d0d]/95 to-transparent">
               <div className="max-w-3xl mx-auto">
                 <div className="relative">
                   {/* Create Memory Dropdown Button - Perfectly aligned */}
@@ -5104,7 +5261,7 @@ function AppContent() {
         <ProfileDialog />
         <ConfirmationModal />
         <ProfileDialog />
-        <div className="h-screen flex bg-[#0d0d0d] text-white overflow-hidden">
+        <div className="h-[100dvh] flex bg-[#0d0d0d] text-white overflow-hidden">
           <main className="flex-1 flex flex-col items-center justify-center p-6 relative">
             <button onClick={cancelRecording} className="absolute top-8 left-8 p-3 hover:bg-white/10 rounded-2xl transition-all active:scale-90"><svg className="w-6 h-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
             <div className="text-center mb-16"><span className="text-[10px] font-bold text-[#10a37f] uppercase tracking-[0.3em] mb-4 block">Capturing Voice</span><h2 className="text-2xl font-bold tracking-tight">Audio Intake Studio</h2></div>
@@ -5129,7 +5286,7 @@ function AppContent() {
         <ProfileDialog />
         <ConfirmationModal />
         <ProfileDialog />
-        <div className="h-screen flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
+        <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
           <div className="flex-1 flex flex-col min-w-0">
             <header className="h-14 lg:h-16 flex items-center px-4 lg:px-6 border-b border-slate-200 dark:border-white/10 bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl"><button onClick={() => setCurrentScreen(SCREENS.MAIN)} className="p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg text-slate-500 transition-colors"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg></button><span className="ml-2 text-sm font-semibold text-slate-600 dark:text-slate-300">Upload Media</span></header>
@@ -5151,7 +5308,7 @@ function AppContent() {
         <ProfileDialog />
         <ConfirmationModal />
         <ProfileDialog />
-        <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden">
+        <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden">
           <div className="text-center max-w-xs animate-fade-in"><div className="relative w-24 h-24 mx-auto mb-10"><div className="absolute inset-0 border-4 border-[#10a37f]/10 rounded-[2rem]"></div><div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-[2rem] animate-spin"></div><div className="absolute inset-0 flex items-center justify-center"><svg className="w-8 h-8 text-[#10a37f] animate-pulse" fill="currentColor" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z" /></svg></div></div><h2 className="text-2xl font-bold mb-3 tracking-tight dark:text-white">Expanding Intelligence</h2><p className="text-xs text-slate-500 font-bold uppercase tracking-[0.2em] mb-8">{processStatus === PROCESS_STATUS.UPLOADING && 'Uploading to cloud...'}{processStatus === PROCESS_STATUS.TRANSCRIBING && 'Analyzing voice patterns...'}{processStatus === PROCESS_STATUS.INDEXING && 'Grounding global memory...'}{processStatus === PROCESS_STATUS.READY && 'Ready!'}</p><div className="w-full bg-slate-100 dark:bg-white/5 h-1.5 rounded-full overflow-hidden"><div className="h-full bg-[#10a37f] transition-all duration-500" style={{ width: processStatus === PROCESS_STATUS.UPLOADING ? '30%' : processStatus === PROCESS_STATUS.TRANSCRIBING ? '60%' : '90%' }}></div></div></div>
         </div>
       </>
@@ -5160,7 +5317,7 @@ function AppContent() {
 
   if (currentScreen === SCREENS.LOGIN || authLoading) {
     return (
-      <div className="h-screen flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden relative">
+      <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden relative">
         <div className="absolute inset-0 bg-gradient-to-br from-[#10a37f]/5 via-transparent to-transparent pointer-events-none" />
         <div className="text-center max-w-md w-full z-10 animate-fade-in">
           {authLoading ? (

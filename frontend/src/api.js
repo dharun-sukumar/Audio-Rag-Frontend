@@ -269,16 +269,34 @@ export const api = {
       throw new Error('No authentication token available');
     }
 
+    // File size validation (400MB limit - adjust if server allows different)
+    const MAX_FILE_SIZE = 400 * 1024 * 1024; // 400MB in bytes
+    if (file.size > MAX_FILE_SIZE) {
+      const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
+      throw new Error(`File size (${fileSizeMB} MB) exceeds the maximum allowed size of 400 MB. Please choose a smaller file.`);
+    }
+
     const formData = new FormData();
     formData.append('file', file);
     if (metadata) {
       formData.append('metadata', JSON.stringify(metadata));
     }
 
+    // Log request details for debugging
+    console.log('Upload request details:', {
+      fileName: file.name,
+      fileSize: file.size,
+      fileSizeMB: (file.size / (1024 * 1024)).toFixed(2),
+      fileType: file.type,
+      hasMetadata: !!metadata,
+      metadataSize: metadata ? JSON.stringify(metadata).length : 0
+    });
+
     const response = await fetch(`${API_BASE_URL}/memories/upload`, {
       method: 'POST',
       headers: {
         'authorization': `Bearer ${token.trim()}`,
+        // Don't set Content-Type - let browser set it with boundary for FormData
       },
       body: formData,
     });
@@ -290,7 +308,15 @@ export const api = {
       } catch (e) {
         errorData = { detail: `HTTP ${response.status} ${response.statusText}` };
       }
-      const errorMessage = errorData.detail?.[0]?.msg || errorData.detail || errorData.message || `Upload failed with status ${response.status}`;
+      
+      // Provide helpful error messages for common status codes
+      let errorMessage;
+      if (response.status === 413) {
+        const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
+        errorMessage = `File too large (${fileSizeMB} MB). The server has a size limit. Please choose a smaller file.`;
+      } else {
+        errorMessage = errorData.detail?.[0]?.msg || errorData.detail || errorData.message || `Upload failed with status ${response.status}`;
+      }
       throw new Error(errorMessage);
     }
 
@@ -390,7 +416,8 @@ export const api = {
       if (tagIdsString) params.append('tag_ids', tagIdsString);
     }
     
-    return apiRequest(`/memories?${params.toString()}`, {
+    // Use trailing slash to avoid 307 redirect
+    return apiRequest(`/memories/?${params.toString()}`, {
       method: 'GET',
     });
   },
