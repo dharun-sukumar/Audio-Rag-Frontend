@@ -228,8 +228,13 @@ function AppContent() {
     if (user) {
       // Only fetch if auth is fully loaded
       if (!authLoading) {
-        fetchConversations()
-        fetchMemories()
+        // Fetch both in parallel for faster loading
+        Promise.allSettled([
+          fetchConversations(),
+          fetchMemories()
+        ]).catch(err => {
+          console.error('Error during initial data fetch:', err)
+        })
       }
       // Tags are lazy-loaded when needed (when opening tag modal or creating memory)
     } else {
@@ -1177,10 +1182,19 @@ function AppContent() {
     setProcessStatus(PROCESS_STATUS.UPLOADING)
     setCurrentScreen(SCREENS.PROCESSING)
     setErrorMessage('')
+    setUploadProgress(0) // Reset progress
     
     try {
       console.log('Uploading memory...')
-      const result = await api.uploadMemory(selectedFile, metadata)
+      const result = await api.uploadMemory(
+        selectedFile, 
+        metadata,
+        (progress) => {
+          // Update progress as upload happens
+          setUploadProgress(progress)
+          console.log(`Upload progress: ${progress.toFixed(1)}%`)
+        }
+      )
       console.log('Memory uploaded successfully:', result)
       
       // OPTIMISTIC UPDATE - Add memory to list immediately
@@ -1689,10 +1703,11 @@ function AppContent() {
     
     try {
       setMemoriesLoading(true)
-      const token = await getIdToken(user, false)
+      // Use cached token if available, otherwise get a new one
+      const token = authToken || await getIdToken(user, false)
       if (!token) {
-        console.warn('fetchMemories: No token available, waiting...')
-        setTimeout(() => fetchMemories(customFilters), 1000)
+        console.warn('fetchMemories: No token available')
+        setMemoriesLoading(false)
         return
       }
       
@@ -1763,10 +1778,10 @@ function AppContent() {
     }
     
     try {
-      const token = await getIdToken(user, false)
+      // Use cached token if available, otherwise get a new one
+      const token = authToken || await getIdToken(user, false)
       if (!token) {
-        console.warn('fetchConversations: No token available, waiting...')
-        setTimeout(() => fetchConversations(), 1000)
+        console.warn('fetchConversations: No token available')
         return
       }
       
@@ -1776,10 +1791,8 @@ function AppContent() {
       setConversations(data || [])
     } catch (err) {
       console.error('Error fetching conversations:', err)
-      console.error('Error details:', {
-        message: err.message,
-        stack: err.stack
-      })
+      // Don't break the app - keep existing conversations if any
+      // This allows the app to continue working even if the API fails
     }
   }
 
@@ -5309,7 +5322,49 @@ function AppContent() {
         <ConfirmationModal />
         <ProfileDialog />
         <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden">
-          <div className="text-center max-w-xs animate-fade-in"><div className="relative w-24 h-24 mx-auto mb-10"><div className="absolute inset-0 border-4 border-[#10a37f]/10 rounded-[2rem]"></div><div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-[2rem] animate-spin"></div><div className="absolute inset-0 flex items-center justify-center"><svg className="w-8 h-8 text-[#10a37f] animate-pulse" fill="currentColor" viewBox="0 0 24 24"><path d="M13 10V3L4 14h7v7l9-11h-7z" /></svg></div></div><h2 className="text-2xl font-bold mb-3 tracking-tight dark:text-white">Expanding Intelligence</h2><p className="text-xs text-slate-500 font-bold uppercase tracking-[0.2em] mb-8">{processStatus === PROCESS_STATUS.UPLOADING && 'Uploading to cloud...'}{processStatus === PROCESS_STATUS.TRANSCRIBING && 'Analyzing voice patterns...'}{processStatus === PROCESS_STATUS.INDEXING && 'Grounding global memory...'}{processStatus === PROCESS_STATUS.READY && 'Ready!'}</p><div className="w-full bg-slate-100 dark:bg-white/5 h-1.5 rounded-full overflow-hidden"><div className="h-full bg-[#10a37f] transition-all duration-500" style={{ width: processStatus === PROCESS_STATUS.UPLOADING ? '30%' : processStatus === PROCESS_STATUS.TRANSCRIBING ? '60%' : '90%' }}></div></div></div>
+          <div className="text-center max-w-xs animate-fade-in">
+            <div className="relative w-24 h-24 mx-auto mb-10">
+              <div className="absolute inset-0 border-4 border-[#10a37f]/10 rounded-[2rem]"></div>
+              <div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-[2rem] animate-spin"></div>
+              <div className="absolute inset-0 flex items-center justify-center">
+                <svg className="w-8 h-8 text-[#10a37f] animate-pulse" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+              </div>
+            </div>
+            <h2 className="text-2xl font-bold mb-3 tracking-tight dark:text-white">Expanding Intelligence</h2>
+            <p className="text-xs text-slate-500 font-bold uppercase tracking-[0.2em] mb-4">
+              {processStatus === PROCESS_STATUS.UPLOADING && 'Uploading to cloud...'}
+              {processStatus === PROCESS_STATUS.TRANSCRIBING && 'Analyzing voice patterns...'}
+              {processStatus === PROCESS_STATUS.INDEXING && 'Grounding global memory...'}
+              {processStatus === PROCESS_STATUS.READY && 'Ready!'}
+            </p>
+            {/* Show actual upload progress when uploading */}
+            {processStatus === PROCESS_STATUS.UPLOADING && uploadProgress > 0 && selectedFile && (
+              <div className="mb-4 space-y-1">
+                <p className="text-xs text-[#10a37f] font-semibold">
+                  {uploadProgress.toFixed(1)}% uploaded
+                </p>
+                <p className="text-[10px] text-slate-400">
+                  {((selectedFile.size * uploadProgress / 100) / 1024 / 1024).toFixed(2)} MB of {((selectedFile.size) / 1024 / 1024).toFixed(2)} MB
+                </p>
+              </div>
+            )}
+            <div className="w-full bg-slate-100 dark:bg-white/5 h-1.5 rounded-full overflow-hidden">
+              <div 
+                className="h-full bg-[#10a37f] transition-all duration-300" 
+                style={{ 
+                  width: processStatus === PROCESS_STATUS.UPLOADING 
+                    ? `${Math.max(uploadProgress, 5)}%` // Show at least 5% during upload
+                    : processStatus === PROCESS_STATUS.TRANSCRIBING 
+                    ? '60%' 
+                    : processStatus === PROCESS_STATUS.INDEXING
+                    ? '90%'
+                    : '100%'
+                }}
+              ></div>
+            </div>
+          </div>
         </div>
       </>
     )

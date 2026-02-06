@@ -67,23 +67,49 @@ async function apiRequest(endpoint, options = {}) {
 
   let response;
   try {
-    response = await fetch(`${API_BASE_URL}${endpoint}`, {
-      ...options,
-      headers,
-    });
+    // Add timeout to fetch requests (30 seconds default, longer for uploads)
+    const timeout = options.timeout || 30000; // 30 seconds default
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+      response = await fetch(`${API_BASE_URL}${endpoint}`, {
+        ...options,
+        headers,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+    } catch (fetchError) {
+      clearTimeout(timeoutId);
+      
+      // Check if it was a timeout
+      if (fetchError.name === 'AbortError' && controller.signal.aborted) {
+        throw new Error(`Request timeout after ${timeout / 1000} seconds. The server may be slow or unresponsive.`);
+      }
+      throw fetchError;
+    }
   } catch (fetchError) {
     // Handle network errors (CORS, connection refused, etc.)
     console.error('Network/Fetch error:', fetchError);
     
+    const errorMessage = fetchError.message || String(fetchError);
+    
+    // Check for connection refused errors
+    if (errorMessage.includes('ERR_CONNECTION_REFUSED') || 
+        errorMessage.includes('connection refused') ||
+        (errorMessage.includes('Failed to fetch') && errorMessage.includes('network'))) {
+      throw new Error('Backend server is not available. Please check if the server is running.');
+    }
+    
     // If it's a CORS error, the backend might be returning an error without CORS headers
-    if (fetchError.message.includes('CORS') || fetchError.message.includes('Failed to fetch')) {
+    if (errorMessage.includes('CORS') || errorMessage.includes('Failed to fetch')) {
       console.error('CORS or network error detected. This could mean:');
       console.error('1. Backend is not running');
       console.error('2. Backend error response missing CORS headers');
       console.error('3. Network connectivity issue');
       throw new Error('Network/CORS error: Check if backend is running and error responses include CORS headers.');
     }
-    throw new Error(`Network error: ${fetchError.message}`);
+    throw new Error(`Network error: ${errorMessage}`);
   }
 
   // If we get a 401, try refreshing the Firebase token
@@ -263,7 +289,7 @@ export const api = {
     }),
 
   // Memory endpoints
-    uploadMemory: async (file, metadata) => {
+    uploadMemory: async (file, metadata, onProgress) => {
     const token = await getAuthToken(false);
     if (!token) {
       throw new Error('No authentication token available');
@@ -292,35 +318,76 @@ export const api = {
       metadataSize: metadata ? JSON.stringify(metadata).length : 0
     });
 
-    const response = await fetch(`${API_BASE_URL}/memories/upload`, {
-      method: 'POST',
-      headers: {
-        'authorization': `Bearer ${token.trim()}`,
-        // Don't set Content-Type - let browser set it with boundary for FormData
-      },
-      body: formData,
-    });
-
-    if (!response.ok) {
-      let errorData;
-      try {
-        errorData = await response.json();
-      } catch (e) {
-        errorData = { detail: `HTTP ${response.status} ${response.statusText}` };
+    // Use XMLHttpRequest for upload progress tracking
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      
+      // Set timeout (20 minutes for large video files)
+      // Nginx timeout is 600s (10 min), but we set longer to account for slow connections
+      xhr.timeout = 20 * 60 * 1000; // 20 minutes
+      
+      // Progress tracking
+      if (onProgress) {
+        xhr.upload.addEventListener('progress', (e) => {
+          if (e.lengthComputable) {
+            const percentComplete = Math.min((e.loaded / e.total) * 100, 100);
+            onProgress(percentComplete);
+          }
+        });
       }
       
-      // Provide helpful error messages for common status codes
-      let errorMessage;
-      if (response.status === 413) {
+      // Handle successful response
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            const response = JSON.parse(xhr.responseText);
+            resolve(response);
+          } catch (e) {
+            // If response is not JSON, return as text
+            resolve(xhr.responseText);
+          }
+        } else {
+          let errorData;
+          try {
+            errorData = JSON.parse(xhr.responseText);
+          } catch (e) {
+            errorData = { detail: `HTTP ${xhr.status} ${xhr.statusText}` };
+          }
+          
+          // Provide helpful error messages for common status codes
+          let errorMessage;
+          if (xhr.status === 413) {
+            const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
+            errorMessage = `File too large (${fileSizeMB} MB). The server has a size limit. Please choose a smaller file.`;
+          } else {
+            errorMessage = errorData.detail?.[0]?.msg || errorData.detail || errorData.message || `Upload failed with status ${xhr.status}`;
+          }
+          reject(new Error(errorMessage));
+        }
+      });
+      
+      // Handle network errors
+      xhr.addEventListener('error', () => {
+        reject(new Error('Network error during upload. Please check your connection and try again.'));
+      });
+      
+      // Handle timeout
+      xhr.addEventListener('timeout', () => {
         const fileSizeMB = (file.size / (1024 * 1024)).toFixed(2);
-        errorMessage = `File too large (${fileSizeMB} MB). The server has a size limit. Please choose a smaller file.`;
-      } else {
-        errorMessage = errorData.detail?.[0]?.msg || errorData.detail || errorData.message || `Upload failed with status ${response.status}`;
-      }
-      throw new Error(errorMessage);
-    }
-
-    return response.json();
+        reject(new Error(`Upload timeout - The file (${fileSizeMB} MB) is too large or your connection is too slow. Please try a smaller file or check your internet connection.`));
+      });
+      
+      // Handle abort
+      xhr.addEventListener('abort', () => {
+        reject(new Error('Upload cancelled'));
+      });
+      
+      // Open and send request
+      xhr.open('POST', `${API_BASE_URL}/memories/upload`);
+      xhr.setRequestHeader('authorization', `Bearer ${token.trim()}`);
+      // Don't set Content-Type - let browser set it with boundary for FormData
+      xhr.send(formData);
+    });
   },
 
   createMemory: (memoryData) =>
