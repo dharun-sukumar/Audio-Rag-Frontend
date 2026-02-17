@@ -23,15 +23,18 @@
     margin: 0;
     min-width: 320px;
     min-height: 100vh;
-    min-height: 100dvh; /* Use dynamic viewport height for mobile browsers */
+    min-height: 100dvh;
+    /* Use dynamic viewport height for mobile browsers */
   }
 }
 
 @layer components {
+
   /* OpenAI style sidebar button active state */
   .nav-item-active {
     background-color: rgba(0, 0, 0, 0.05);
   }
+
   .dark .nav-item-active {
     background-color: rgba(255, 255, 255, 0.1);
   }
@@ -42,6 +45,7 @@
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
   }
+
   .dark .glass-header {
     background: rgba(13, 13, 13, 0.8);
   }
@@ -52,6 +56,7 @@
     backdrop-filter: blur(8px);
     border: 1px solid rgba(255, 255, 255, 0.08);
   }
+
   .dark .glass-card {
     background: rgba(255, 255, 255, 0.02);
   }
@@ -61,6 +66,7 @@
     transform: translateX(-100%);
     transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   }
+
   .sidebar-drawer.open {
     transform: translateX(0);
   }
@@ -84,22 +90,27 @@
   .custom-scrollbar::-webkit-scrollbar {
     width: 4px;
   }
+
   .custom-scrollbar::-webkit-scrollbar-track {
     background: transparent;
   }
+
   .custom-scrollbar::-webkit-scrollbar-thumb {
     background: rgba(0, 0, 0, 0.1);
     border-radius: 10px;
   }
+
   .dark .custom-scrollbar::-webkit-scrollbar-thumb {
     background: rgba(255, 255, 255, 0.1);
   }
+
   .custom-scrollbar::-webkit-scrollbar-thumb:hover {
     background: rgba(16, 163, 127, 0.4);
   }
 }
 
 @layer utilities {
+
   /* Smooth transitions */
   * {
     transition: background-color 0.2s ease, border-color 0.2s ease, opacity 0.2s ease;
@@ -107,19 +118,42 @@
 
   /* Custom Waveform Animation (more subtle) */
   @keyframes wave-subtle {
-    0%, 100% { height: 4px; transform: scaleY(1); }
-    50% { height: 24px; transform: scaleY(1.2); }
+
+    0%,
+    100% {
+      height: 4px;
+      transform: scaleY(1);
+    }
+
+    50% {
+      height: 24px;
+      transform: scaleY(1.2);
+    }
   }
 
   @keyframes bounce-subtle {
-    0%, 100% { transform: translateY(0); }
-    50% { transform: translateY(-10px); }
+
+    0%,
+    100% {
+      transform: translateY(0);
+    }
+
+    50% {
+      transform: translateY(-10px);
+    }
   }
 
   /* Premium Animations */
   @keyframes fadeIn {
-    from { opacity: 0; transform: translateY(10px); }
-    to { opacity: 1; transform: translateY(0); }
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
   }
 
   /* OpenAI style focus ring */
@@ -127,7 +161,98 @@
     outline: none;
     box-shadow: 0 0 0 2px rgba(16, 163, 127, 0.2);
   }
+
+  /* Subtle shake for errors */
+  @keyframes shake {
+
+    0%,
+    100% {
+      transform: translateX(0);
+    }
+
+    25% {
+      transform: translateX(-4px);
+    }
+
+    75% {
+      transform: translateX(4px);
+    }
+  }
+
+  .animate-shake {
+    animation: shake 0.4s cubic-bezier(.36, .07, .19, .97) both;
+  }
+
+  /* Login prompt animations */
+  @keyframes slideInFromBottom4 {
+    from {
+      opacity: 0;
+      transform: translateY(16px);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes slideInFromBottom8 {
+    from {
+      opacity: 0;
+      transform: translateY(32px);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes zoomIn95 {
+    from {
+      opacity: 0;
+      transform: scale(0.95);
+    }
+
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  .animate-in {
+    animation-fill-mode: both;
+  }
+
+  .fade-in {
+    animation-name: fadeIn;
+  }
+
+  .slide-in-from-bottom-4 {
+    animation-name: slideInFromBottom4;
+  }
+
+  .slide-in-from-bottom-8 {
+    animation-name: slideInFromBottom8;
+  }
+
+  .zoom-in-95 {
+    animation-name: zoomIn95;
+  }
+
+  .duration-300 {
+    animation-duration: 300ms;
+  }
+
+  .duration-500 {
+    animation-duration: 500ms;
+  }
 }
 
-.wave-bar:nth-child(even) { animation-duration: 0.8s; }
-.wave-bar:nth-child(3n) { animation-duration: 1.5s; }
+.wave-bar:nth-child(even) {
+  animation-duration: 0.8s;
+}
+
+.wave-bar:nth-child(3n) {
+  animation-duration: 1.5s;
+}

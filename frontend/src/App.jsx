@@ -1,9 +1,25 @@
-  import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, memo } from 'react'
 import { useNavigate, useParams, Routes, Route } from 'react-router-dom'
 import './App.css'
 import { auth, googleProvider } from './firebase'
 import { signInWithPopup, signOut, onAuthStateChanged, getIdToken } from 'firebase/auth'
-import { api } from './api'
+import { api, getOrCreateGuestId } from './api'
+
+// Import components
+import SideLoginCard from './components/auth/SideLoginCard'
+import CenteredLoginModal from './components/auth/CenteredLoginModal'
+import LoginModal from './components/auth/LoginModal'
+import ToastContainer from './components/modals/ToastContainer'
+import ProfileDialog from './components/modals/ProfileDialog'
+import DateDetailsModal from './components/modals/DateDetailsModal'
+import SearchModal from './components/modals/SearchModal'
+import ConfirmationModal from './components/modals/ConfirmationModal'
+
+// Clear side login card dismissed flag on full page load so the card shows again after reload.
+// During the same session (e.g. on remount from keyboard) we keep reading from sessionStorage so the card stays hidden.
+if (typeof sessionStorage !== 'undefined') {
+  sessionStorage.removeItem('hasDismissedSideCard')
+}
 
 const SCREENS = {
   MAIN: 'main',
@@ -16,6 +32,7 @@ const SCREENS = {
   VIEW_RECORDING: 'view_recording', // Legacy screen for viewing recording + transcription
   VIEW_MEMORY: 'view_memory', // Screen for viewing memory details with audio and transcription
   CREATE_TEXT_MEMORY: 'create_text_memory', // Screen for creating text-based memories
+  CALENDAR: 'calendar', // Full-page calendar view
 }
 
 const PROCESS_STATUS = {
@@ -43,7 +60,6 @@ function AppContent() {
   const [editingConversationId, setEditingConversationId] = useState(null)
   const [editingConversationTitle, setEditingConversationTitle] = useState('')
   const [calendarDate, setCalendarDate] = useState(new Date())
-  const [showCalendarDropdown, setShowCalendarDropdown] = useState(false)
   const [calendarActivity, setCalendarActivity] = useState({})
   const [loadedCalendarMonths, setLoadedCalendarMonths] = useState(new Set())
   const [selectedDateDetails, setSelectedDateDetails] = useState(null)
@@ -54,30 +70,41 @@ function AppContent() {
   const [isRecording, setIsRecording] = useState(false)
   const [recordingTime, setRecordingTime] = useState(0)
   const [savedRecordingDuration, setSavedRecordingDuration] = useState(0)
-  const [activeTab, setActiveTab] = useState('chat') 
+  const [activeTab, setActiveTab] = useState('chat')
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [recordingName, setRecordingName] = useState('')
-  
+
   // Authentication state
   const [user, setUser] = useState(null)
   const [authLoading, setAuthLoading] = useState(true)
   const [showLoginModal, setShowLoginModal] = useState(false)
+  const [hasDismissedLoginPrompt, setHasDismissedLoginPrompt] = useState(false)
+  const [shouldShakeLogin, setShouldShakeLogin] = useState(false)
   const [imageError, setImageError] = useState(new Set())
   const [authToken, setAuthToken] = useState(null)
-  
+
+  // New sophisticated login prompt state (side card: only show again after reload)
+  const [guestMessageCount, setGuestMessageCount] = useState(0)
+  const [hasDismissedSideCard, setHasDismissedSideCard] = useState(
+    () => typeof sessionStorage !== 'undefined' && sessionStorage.getItem('hasDismissedSideCard') === 'true'
+  )
+  const [showCenteredModal, setShowCenteredModal] = useState(false)
+  const [loginPromptCooldownActive, setLoginPromptCooldownActive] = useState(false)
+  const [modalDismissTime, setModalDismissTime] = useState(null)
+
   // New state for viewing recording
   const [selectedRecording, setSelectedRecording] = useState(null)
   const [recordingTranscription, setRecordingTranscription] = useState(null)
   const [loadingRecording, setLoadingRecording] = useState(false)
-  
+
   const [highlightedTimestamp, setHighlightedTimestamp] = useState(null)
-  
+
   const [currentTranscript, setCurrentTranscript] = useState([
     { speaker: 'Speaker 1', timestamp: '0:00', text: 'Welcome to the strategy session. We are here to talk about the Q3 expansion.' },
     { speaker: 'Speaker 2', timestamp: '0:15', text: 'The focus should be on European markets specifically.' },
     { speaker: 'Speaker 1', timestamp: '0:42', text: 'Agreed. Let us look at the budget allocation for Berlin and Paris.' }
   ])
-  
+
   // Memory and tag state
   const [memories, setMemories] = useState([])
   const [memoryPagination, setMemoryPagination] = useState({ total: 0, page: 1, page_size: 20, total_pages: 0 })
@@ -101,7 +128,7 @@ function AppContent() {
   const [editingMemory, setEditingMemory] = useState(false)
   const [newTagName, setNewTagName] = useState('')
   const [newTagColor, setNewTagColor] = useState('#10a37f')
-  
+
   // Memory filters
   const [memorySearchQuery, setMemorySearchQuery] = useState('')
   const [memoryMediaTypeFilter, setMemoryMediaTypeFilter] = useState(null)
@@ -109,20 +136,20 @@ function AppContent() {
   const [memoryStatusFilter, setMemoryStatusFilter] = useState(null)
   const [memoryTopicFilter, setMemoryTopicFilter] = useState('')
   const [selectedFilterTags, setSelectedFilterTags] = useState([])
-  
+
   // Search modal state
   const [showSearchModal, setShowSearchModal] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState({ conversations: [], memories: [] })
   const [isSearching, setIsSearching] = useState(false)
-  
+
   // Create Memory dropdown state
   const [showCreateMemoryDropdown, setShowCreateMemoryDropdown] = useState(false)
-  
+
   // Refs for search optimization
   const searchAbortControllerRef = useRef(null)
   const conversationsCacheRef = useRef([])
-  
+
   // Confirmation modal state
   const [confirmationModal, setConfirmationModal] = useState({
     show: false,
@@ -133,7 +160,7 @@ function AppContent() {
     onConfirm: null,
     type: 'warning' // 'warning', 'danger', 'info'
   })
-  
+
   const mediaRecorderRef = useRef(null)
   const audioChunksRef = useRef([])
   const recordingTimerRef = useRef(null)
@@ -150,7 +177,8 @@ function AppContent() {
   const userRef = useRef(null)
   // When we create a conversation from the first message, skip the route effect loading it (we handle messages in askQuestion)
   const skipLoadForConversationIdRef = useRef(null)
-  
+  const textareaRef = useRef(null)
+
 
   // Audio playback state
   const [audioUrl, setAudioUrl] = useState(null)
@@ -164,12 +192,20 @@ function AppContent() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, isThinking])
 
+  // Auto-expand textarea height
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto'
+      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 300)}px`
+    }
+  }, [inputQuery])
+
   // Auto-scroll to active utterance
   useEffect(() => {
     if (activeUtteranceIndex !== null && activeUtteranceRef.current) {
-      activeUtteranceRef.current.scrollIntoView({ 
-        behavior: 'smooth', 
-        block: 'center' 
+      activeUtteranceRef.current.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center'
       })
     }
   }, [activeUtteranceIndex])
@@ -217,31 +253,58 @@ function AppContent() {
         }
       } else {
         setAuthToken(null)
+        setConversations([])
+        setMemories([])
+        setTags([])
       }
     })
 
     return () => unsubscribe()
   }, [])
 
+  // Load and persist login prompt state from sessionStorage
+  useEffect(() => {
+    // Load from sessionStorage on mount
+    const savedMessageCount = sessionStorage.getItem('guestMessageCount')
+    const savedDismissedSideCard = sessionStorage.getItem('hasDismissedSideCard')
+    const savedCooldownActive = sessionStorage.getItem('loginPromptCooldownActive')
+    const savedDismissTime = sessionStorage.getItem('modalDismissTime')
+
+    if (savedMessageCount) setGuestMessageCount(parseInt(savedMessageCount))
+    if (savedDismissedSideCard === 'true') setHasDismissedSideCard(true)
+    if (savedCooldownActive === 'true') setLoginPromptCooldownActive(true)
+    if (savedDismissTime) setModalDismissTime(parseInt(savedDismissTime))
+  }, [])
+
+  // Persist login prompt state to sessionStorage
+  useEffect(() => {
+    sessionStorage.setItem('guestMessageCount', guestMessageCount.toString())
+  }, [guestMessageCount])
 
   useEffect(() => {
-    if (user) {
-      // Only fetch if auth is fully loaded
-      if (!authLoading) {
-        // Fetch both in parallel for faster loading
-        Promise.allSettled([
-          fetchConversations(),
-          fetchMemories()
-        ]).catch(err => {
-          console.error('Error during initial data fetch:', err)
-        })
-      }
-      // Tags are lazy-loaded when needed (when opening tag modal or creating memory)
-    } else {
-      setConversations([])
-      setMemories([])
-      setTags([])
-      setMemoriesLoading(false)
+    sessionStorage.setItem('hasDismissedSideCard', hasDismissedSideCard.toString())
+  }, [hasDismissedSideCard])
+
+  useEffect(() => {
+    sessionStorage.setItem('loginPromptCooldownActive', loginPromptCooldownActive.toString())
+  }, [loginPromptCooldownActive])
+
+  useEffect(() => {
+    if (modalDismissTime) {
+      sessionStorage.setItem('modalDismissTime', modalDismissTime.toString())
+    }
+  }, [modalDismissTime])
+
+
+  // Fetch conversations and memories when auth state is ready (authenticated or guest)
+  useEffect(() => {
+    if (!authLoading) {
+      Promise.allSettled([
+        fetchConversations(),
+        fetchMemories()
+      ]).catch(err => {
+        console.error('Error during initial data fetch:', err)
+      })
     }
   }, [user, authLoading])
 
@@ -263,7 +326,7 @@ function AppContent() {
     }
 
     const interval = setInterval(refreshTokens, 50 * 60 * 1000)
-    
+
     return () => clearInterval(interval)
   }, [user])
 
@@ -277,14 +340,14 @@ function AppContent() {
         setSearchQuery('')
         setSearchResults({ conversations: [], memories: [] })
       }
-      
+
       // Close search modal on Escape
       if (e.key === 'Escape' && showSearchModal) {
         setShowSearchModal(false)
         setSearchQuery('')
         setSearchResults({ conversations: [], memories: [] })
       }
-      
+
       // Close create memory dropdown on Escape
       if (e.key === 'Escape' && showCreateMemoryDropdown) {
         setShowCreateMemoryDropdown(false)
@@ -298,13 +361,13 @@ function AppContent() {
   // Close dropdown when clicking outside
   useEffect(() => {
     if (!showCreateMemoryDropdown) return
-    
+
     const handleClickOutside = (e) => {
       if (!e.target.closest('.create-memory-dropdown')) {
         setShowCreateMemoryDropdown(false)
       }
     }
-    
+
     document.addEventListener('mousedown', handleClickOutside)
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [showCreateMemoryDropdown])
@@ -312,7 +375,7 @@ function AppContent() {
   // Memoized search function with proper error handling and request cancellation
   const performSearch = useCallback(async (query) => {
     const trimmedQuery = query.trim()
-    
+
     // Minimum query length to avoid too many API calls
     if (trimmedQuery.length < 2) {
       setSearchResults({ conversations: [], memories: [] })
@@ -338,19 +401,19 @@ function AppContent() {
         conversationsData = await api.listConversations(0, 100)
         conversationsCacheRef.current = conversationsData
       }
-      
+
       // Client-side filter conversations (fast, no API call needed)
-      const filteredConversations = conversationsData.filter(conv => 
+      const filteredConversations = conversationsData.filter(conv =>
         conv.title?.toLowerCase().includes(trimmedQuery.toLowerCase())
       )
 
       // Search memories via API (only if query is long enough)
       let filteredMemories = []
       if (trimmedQuery.length >= 2) {
-        const memoriesData = await api.listMemories({ 
-          search: trimmedQuery, 
-          page: 1, 
-          page_size: 20 
+        const memoriesData = await api.listMemories({
+          search: trimmedQuery,
+          page: 1,
+          page_size: 20
         })
         filteredMemories = memoriesData.items || []
       }
@@ -424,12 +487,12 @@ function AppContent() {
   // Lazy-load tags when needed (tag modal opens or on memory creation screens)
   useEffect(() => {
     if (!user) return
-    
-    const needsTags = showTagModal || 
-                     showTagManagementModal || 
-                     currentScreen === SCREENS.REVIEW || 
-                     currentScreen === SCREENS.CREATE_TEXT_MEMORY
-    
+
+    const needsTags = showTagModal ||
+      showTagManagementModal ||
+      currentScreen === SCREENS.REVIEW ||
+      currentScreen === SCREENS.CREATE_TEXT_MEMORY
+
     // Only fetch if tags are needed and not already loaded
     if (needsTags && tags.length === 0) {
       fetchTags()
@@ -450,12 +513,14 @@ function AppContent() {
     }
   }, [currentScreen])
 
-  // Fetch calendar data when calendar date changes or dropdown opens
+  // Fetch calendar data when calendar date changes or calendar screen opens
   useEffect(() => {
-    if (user && showCalendarDropdown) {
+    if (user && currentScreen === SCREENS.CALENDAR) {
       fetchCalendarData(calendarDate)
     }
-  }, [user, calendarDate, showCalendarDropdown])
+  }, [user, calendarDate, currentScreen])
+
+
 
   // Copy token to clipboard
   const formatTime = (seconds) => {
@@ -476,9 +541,18 @@ function AppContent() {
 
   // Authentication functions
   const handleGoogleSignIn = async () => {
+    const guestId = typeof localStorage !== 'undefined' ? localStorage.getItem('guestId') : null
     try {
       setErrorMessage('')
       await signInWithPopup(auth, googleProvider)
+      if (guestId) {
+        try {
+          await api.mergeGuestAccount(guestId)
+          localStorage.removeItem('guestId')
+        } catch (mergeErr) {
+          console.error('Guest merge failed (user is still signed in):', mergeErr)
+        }
+      }
       console.log('Signed in successfully - using Firebase ID token for API calls')
     } catch (error) {
       console.error('Sign in error:', error)
@@ -500,9 +574,9 @@ function AppContent() {
       cancelText: 'Cancel',
       type: 'warning'
     })
-    
+
     if (!confirmed) return
-    
+
     try {
       await signOut(auth)
       setMessages([])
@@ -536,12 +610,17 @@ function AppContent() {
       const conversation = await api.createConversation('New Chat')
       setConversations(prev => [conversation, ...prev])
       fetchConversations().catch(err => console.error('Error refreshing conversations:', err))
-      if (showCalendarDropdown) fetchCalendarData(calendarDate)
+      if (currentScreen === SCREENS.CALENDAR) fetchCalendarData(calendarDate)
       return conversation.id
     } catch (err) {
       console.error('Failed to create conversation:', err)
-      setErrorMessage(`Failed to create conversation: ${err.message}`)
-      showToast('Failed to create conversation', 'error')
+      if (err.guestLimitReached) {
+        setShowLoginModal(true)
+        showToast('Sign in to continue with more conversations', 'info')
+      } else {
+        setErrorMessage(`Failed to create conversation: ${err.message}`)
+        showToast('Failed to create conversation', 'error')
+      }
       return null
     }
   }
@@ -576,12 +655,17 @@ function AppContent() {
       setConversations(prev => [conversation, ...prev])
       navigate(`/conversation/${conversation.id}`)
       fetchConversations().catch(err => console.error('Error refreshing conversations:', err))
-      if (showCalendarDropdown) fetchCalendarData(calendarDate)
+      if (currentScreen === SCREENS.CALENDAR) fetchCalendarData(calendarDate)
       return conversation.id
     } catch (err) {
       console.error('Failed to create conversation:', err)
-      setErrorMessage(`Failed to create conversation: ${err.message}`)
-      showToast('Failed to create conversation', 'error')
+      if (err.guestLimitReached) {
+        setShowLoginModal(true)
+        showToast('Sign in to continue with more conversations', 'info')
+      } else {
+        setErrorMessage(`Failed to create conversation: ${err.message}`)
+        showToast('Failed to create conversation', 'error')
+      }
       return null
     }
   }
@@ -590,12 +674,12 @@ function AppContent() {
   // Load a conversation (public function that navigates)
   const loadConversation = async (conversation) => {
     if (!(await requireAuth('load conversation'))) return
-    
+
     // Set loading state immediately for better UX
     setLoadingConversation(true)
     setMessages([])
     setCurrentScreen(SCREENS.MAIN)
-    
+
     // Navigate to the conversation route
     navigate(`/conversation/${conversation.id}`)
   }
@@ -613,20 +697,20 @@ function AppContent() {
       setEditingConversationId(null)
       return
     }
-    
+
     try {
       console.log('Updating conversation title:', conversationId, editingConversationTitle)
       await api.updateConversation(conversationId, editingConversationTitle.trim())
-      
+
       // Update local state
-      setConversations(prev => 
-        prev.map(conv => 
-          conv.id === conversationId 
-            ? { ...conv, title: editingConversationTitle.trim() } 
+      setConversations(prev =>
+        prev.map(conv =>
+          conv.id === conversationId
+            ? { ...conv, title: editingConversationTitle.trim() }
             : conv
         )
       )
-      
+
       setEditingConversationId(null)
       setEditingConversationTitle('')
       showToast('Conversation renamed', 'success')
@@ -650,7 +734,7 @@ function AppContent() {
     if (e) {
       e.stopPropagation()
     }
-    
+
     const confirmed = await showConfirmation({
       title: 'Delete Conversation',
       message: 'Are you sure you want to delete this conversation? All messages will be lost.',
@@ -658,25 +742,25 @@ function AppContent() {
       cancelText: 'Cancel',
       type: 'danger'
     })
-    
+
     if (!confirmed) {
       return
     }
-    
+
     // Store the conversation for potential rollback
     const conversationToDelete = conversations.find(conv => conv.id === conversationId)
-    
+
     // OPTIMISTIC UPDATE - Remove from UI immediately
     console.log('Deleting conversation (optimistic):', conversationId)
     setConversations(prev => prev.filter(conv => conv.id !== conversationId))
-    
+
     // If we're deleting the current conversation, clear it and navigate away
     if (currentConversationId === conversationId) {
       setCurrentConversationId(null)
       setMessages([])
       navigate('/')
     }
-    
+
     try {
       // Call API in background
       await api.deleteConversation(conversationId)
@@ -686,63 +770,66 @@ function AppContent() {
       console.error('Failed to delete conversation:', err)
       setErrorMessage(`Failed to delete conversation: ${err.message}`)
       showToast('Failed to delete conversation', 'error')
-      
+
       // ROLLBACK - Restore the conversation if API call failed
       if (conversationToDelete) {
         console.log('Rolling back deletion, restoring conversation')
-        setConversations(prev => [...prev, conversationToDelete].sort((a, b) => 
+        setConversations(prev => [...prev, conversationToDelete].sort((a, b) =>
           new Date(b.updated_at) - new Date(a.updated_at)
         ))
       }
     }
   }
 
-  // Check if user needs to login for protected actions
+  // Require either authenticated user or guest (guest ID created if missing)
   const requireAuth = async (action) => {
-    // Wait for auth to finish loading before checking user
     if (authLoadingRef.current) {
-      // Wait for auth to finish loading (max 2 seconds)
       let attempts = 0
       while (authLoadingRef.current && attempts < 20) {
         await new Promise(resolve => setTimeout(resolve, 100))
         attempts++
       }
     }
-    
-    // Check user state - use both ref and Firebase's currentUser as fallback
-    // Firebase's currentUser is synchronous and available immediately if logged in
     const currentUser = userRef.current || auth.currentUser
-    
-    if (!currentUser) {
+    if (currentUser) return true
+
+    // If guest is trying to perform key actions, prompt them to login
+    if (action === 'ask' || action === 'create conversation' || action === 'upload' || action === 'record') {
       setShowLoginModal(true)
-      return false
+      setHasDismissedLoginPrompt(false) // Re-show even if previously dismissed for these actions
+
+      const isExceededChat = action === 'create conversation' && conversations.length >= 1
+      const isRestricted = action === 'upload' || action === 'record'
+
+      if (isExceededChat || isRestricted) {
+        // Trigger shake animation for blocks
+        setShouldShakeLogin(true)
+        setTimeout(() => setShouldShakeLogin(false), 500)
+        return false
+      }
     }
-    
-    // Update refs if they're out of sync (shouldn't happen, but just in case)
-    if (userRef.current !== currentUser) {
-      userRef.current = currentUser
-    }
-    
+
+    getOrCreateGuestId()
     return true
   }
 
   // Load a conversation by ID (internal function)
   const loadConversationById = useCallback(async (conversationId) => {
     if (!(await requireAuth('load conversation'))) return
-    
+
     setLoadingConversation(true)
     try {
       console.log('Loading conversation by ID:', conversationId)
       setCurrentConversationId(conversationId)
       setErrorMessage('')
-      
+
       // Navigate to main chat screen
       setCurrentScreen(SCREENS.MAIN)
-      
+
       // Fetch messages for this conversation
       const messages = await api.getConversationMessages(conversationId, 0, 100)
       console.log('Messages fetched:', messages)
-      
+
       // Don't overwrite messages if we're in the middle of sending the first message (askQuestion owns the state)
       if (skipLoadForConversationIdRef.current) {
         console.log('Skipping setMessages in loadConversationById (first-message flow active)')
@@ -754,7 +841,7 @@ function AppContent() {
           : list
         setMessages(sorted)
       }
-      
+
       if (window.innerWidth < 1024) setSidebarOpen(false)
     } catch (err) {
       console.error('Failed to load conversation:', err)
@@ -768,8 +855,9 @@ function AppContent() {
 
   // Load conversation from URL parameter
   useEffect(() => {
-    if (!user) return
-    
+    // We allow loading as guest or authenticated user
+    if (authLoading) return
+
     if (conversationId) {
       // Skip if we're in the middle of creating/sending first message (askQuestion owns the state; ref is true or the new id)
       if (skipLoadForConversationIdRef.current) return
@@ -777,18 +865,18 @@ function AppContent() {
       if (conversationId !== currentConversationId) {
         // Wait for conversations to load if not available yet
         if (conversations.length === 0) {
-          // Conversations not loaded yet, wait a bit
+          // If we haven't loaded conversations yet, we can't verify if it exists
+          // But we can try to load it anyway if it's a direct link
+          loadConversationById(conversationId)
           return
         }
-        
+
         const conversation = conversations.find(conv => conv.id === conversationId)
         if (conversation) {
           loadConversationById(conversationId)
         } else {
-          // Conversation not found, navigate to home
-          navigate('/')
-          setCurrentConversationId(null)
-          setMessages([])
+          // If not found in current list, try fetching it directly before giving up
+          loadConversationById(conversationId)
         }
       }
     } else if (!conversationId && currentConversationId) {
@@ -797,7 +885,7 @@ function AppContent() {
       setCurrentConversationId(null)
       setMessages([])
     }
-  }, [conversationId, user, conversations, currentConversationId, navigate, loadConversationById])
+  }, [conversationId, authLoading, conversations, currentConversationId, navigate, loadConversationById])
 
   // Get user initials for avatar
   const getUserInitials = (user) => {
@@ -857,7 +945,7 @@ function AppContent() {
       }
 
       analyserRef.current.getByteFrequencyData(dataArrayRef.current)
-      
+
       // Convert frequency data to waveform bars (32 bars)
       const bars = []
       const step = Math.floor(dataArrayRef.current.length / 32)
@@ -867,7 +955,7 @@ function AppContent() {
         // Normalize to 0-1 range and apply some scaling
         bars.push(value / 255)
       }
-      
+
       setWaveformData(bars)
       animationFrameRef.current = requestAnimationFrame(animateWaveform)
     }
@@ -885,7 +973,7 @@ function AppContent() {
   const togglePlayback = () => {
     const audio = audioPlayerRef.current
     if (!audio) return
-    
+
     if (isPlaying) {
       audio.pause()
       setIsPlaying(false)
@@ -935,14 +1023,14 @@ function AppContent() {
   // Helper function to discard memory and return to main
   const handleDiscardMemory = async () => {
     // Check if there are any changes to discard
-    const hasChanges = selectedFile || 
-                       memoryTitle?.trim() || 
-                       memoryText?.trim() || 
-                       memoryTopic?.trim() || 
-                       memoryMood !== null || 
-                       memoryPeople?.trim() || 
-                       selectedTags.length > 0
-    
+    const hasChanges = selectedFile ||
+      memoryTitle?.trim() ||
+      memoryText?.trim() ||
+      memoryTopic?.trim() ||
+      memoryMood !== null ||
+      memoryPeople?.trim() ||
+      selectedTags.length > 0
+
     if (hasChanges) {
       const confirmed = await showConfirmation({
         title: 'Discard Memory',
@@ -953,7 +1041,7 @@ function AppContent() {
       })
       if (!confirmed) return
     }
-    
+
     setSelectedFile(null)
     setSavedRecordingDuration(0)
     setIsPlaying(false)
@@ -971,7 +1059,7 @@ function AppContent() {
   const toggleRecordingPlayback = () => {
     const audio = recordingAudioRef.current
     if (!audio) return
-    
+
     if (isPlaying) {
       audio.pause()
       setIsPlaying(false)
@@ -985,10 +1073,10 @@ function AppContent() {
   const handleAudioTimeUpdate = () => {
     const audio = recordingAudioRef.current
     if (!audio) return
-    
+
     const currentTime = audio.currentTime * 1000 // Convert to milliseconds
     setCurrentPlaybackTime(currentTime)
-    
+
     // Find the active utterance based on current playback time
     if (recordingTranscription && typeof recordingTranscription === 'object') {
       if (recordingTranscription.utterances && Array.isArray(recordingTranscription.utterances)) {
@@ -1029,7 +1117,7 @@ function AppContent() {
       audio = audioPlayerRef.current
     }
     if (!audio) return
-    
+
     const timeSeconds = typeof timeMs === 'number' ? (timeMs / 1000) : parseFloat(timeMs)
     audio.currentTime = timeSeconds
     if (!isPlaying) {
@@ -1044,14 +1132,14 @@ function AppContent() {
   const handleFileSelect = async (e) => {
     const file = e.target.files[0]
     if (!file) return
-    
+
     // Check file type
     if (!(file.type.startsWith('audio/') || file.type.startsWith('video/'))) {
       setErrorMessage('Please select an audio or video file.')
       e.target.value = ''
       return
     }
-    
+
     // Check file size (400MB limit)
     const MAX_FILE_SIZE = 400 * 1024 * 1024; // 400MB in bytes
     if (file.size > MAX_FILE_SIZE) {
@@ -1061,16 +1149,16 @@ function AppContent() {
       e.target.value = ''
       return
     }
-    
+
     if (!(await requireAuth('upload'))) {
-      e.target.value = '' 
+      e.target.value = ''
       return
     }
-    
+
     setSelectedFile(file)
     setRecordingName(`${file.name.replace(/\.[^/.]+$/, '')}`)
     setErrorMessage('') // Clear any previous errors
-    
+
     const url = URL.createObjectURL(file)
     const media = document.createElement(file.type.startsWith('video/') ? 'video' : 'audio')
     media.src = url
@@ -1082,7 +1170,7 @@ function AppContent() {
       setSavedRecordingDuration(0)
       URL.revokeObjectURL(url)
     }
-    
+
     setCurrentScreen(SCREENS.REVIEW)
   }
 
@@ -1144,50 +1232,50 @@ function AppContent() {
       console.error('User not authenticated, cannot upload')
       return
     }
-    
+
     if (!selectedFile) {
       console.error('No file selected')
       setErrorMessage('No file selected. Please record or upload an audio/video file first.')
       return
     }
-    
+
     // Prepare metadata
     const metadata = {
       title: memoryTitle || recordingName || selectedFile.name,
       description: memoryText || '',
       tag_ids: selectedTags.map(tag => tag.id)
     }
-    
+
     // Add optional fields if provided
     if (memoryTopic?.trim()) {
       metadata.topic = memoryTopic.trim()
     }
-    
+
     if (memoryMood !== null && memoryMood >= 1 && memoryMood <= 5) {
       metadata.mood = memoryMood
     }
-    
+
     if (memoryPeople?.trim()) {
       // Split by comma and trim whitespace
       metadata.people = memoryPeople.split(',').map(p => p.trim()).filter(p => p)
     }
-    
+
     console.log('Starting memory upload:', {
       filename: selectedFile.name,
       type: selectedFile.type,
       size: selectedFile.size,
       metadata
     })
-    
+
     setProcessStatus(PROCESS_STATUS.UPLOADING)
     setCurrentScreen(SCREENS.PROCESSING)
     setErrorMessage('')
     setUploadProgress(0) // Reset progress
-    
+
     try {
       console.log('Uploading memory...')
       const result = await api.uploadMemory(
-        selectedFile, 
+        selectedFile,
         metadata,
         (progress) => {
           // Update progress as upload happens
@@ -1196,7 +1284,7 @@ function AppContent() {
         }
       )
       console.log('Memory uploaded successfully:', result)
-      
+
       // OPTIMISTIC UPDATE - Add memory to list immediately
       if (result && result.id) {
         const newMemory = {
@@ -1206,31 +1294,31 @@ function AppContent() {
           created_at: result.created_at || new Date().toISOString(),
           tags: selectedTags
         }
-        
+
         // Add to the beginning of the list
         setMemories(prev => [newMemory, ...prev])
-        
+
         // Update pagination
         setMemoryPagination(prev => ({
           ...prev,
           total: prev.total + 1
         }))
       }
-      
+
       setProcessStatus(PROCESS_STATUS.TRANSCRIBING)
-      
+
       // The backend will process asynchronously
       // For now, we'll show success after a short delay
       await new Promise(r => setTimeout(r, 1500))
-      
+
       setProcessStatus(PROCESS_STATUS.READY)
-      
+
       console.log('Refreshing data to get latest state...')
       // Refresh to get the latest state from backend (including processing status)
       fetchMemories()
       // Always reload calendar data after memory upload (force refresh to get new memory)
       fetchCalendarData(calendarDate, true)
-      
+
       // Reset memory form
       setMemoryTitle(null)
       setHasEditedTitle(false)
@@ -1239,7 +1327,7 @@ function AppContent() {
       setMemoryMood(null)
       setMemoryPeople('')
       setSelectedTags([])
-      
+
       showToast('Memory uploaded successfully! Processing in background...', 'success')
       setTimeout(() => setCurrentScreen(SCREENS.MAIN), 800)
     } catch (err) {
@@ -1247,7 +1335,7 @@ function AppContent() {
       setProcessStatus(PROCESS_STATUS.FAILED)
       setErrorMessage(err.message || 'Failed to upload memory.')
       showToast('Failed to upload memory', 'error')
-      
+
       // If we had optimistically added it, we should remove it on error
       // But since we only add if result exists, this shouldn't be needed
     }
@@ -1258,54 +1346,54 @@ function AppContent() {
       console.error('User not authenticated, cannot create text memory')
       return
     }
-    
+
     if (!memoryText.trim()) {
       setErrorMessage('Please enter some text for your memory.')
       showToast('Please enter text content', 'error')
       return
     }
-    
+
     // Prepare metadata object
     const metadata = {}
-    
+
     // Add optional fields if provided
     if (memoryTitle?.trim()) {
       metadata.title = memoryTitle.trim()
     }
-    
+
     if (memoryTopic?.trim()) {
       metadata.topic = memoryTopic.trim()
     }
-    
+
     if (memoryMood !== null && memoryMood >= 1 && memoryMood <= 5) {
       metadata.mood = memoryMood
     }
-    
+
     if (memoryPeople?.trim()) {
       // Split by comma and trim whitespace
       metadata.people = memoryPeople.split(',').map(p => p.trim()).filter(p => p)
     }
-    
+
     // Automatically set today's date
     const today = new Date()
     metadata.memory_date = today.toISOString()
-    
+
     // Add tag IDs if any tags are selected
     if (selectedTags.length > 0) {
       metadata.tag_ids = selectedTags.map(tag => tag.id)
     }
-    
+
     console.log('Creating text memory:', {
       text_content: memoryText.trim(),
       metadata
     })
     setErrorMessage('')
-    
+
     try {
       console.log('Creating text memory...')
       const result = await api.createTextMemory(memoryText.trim(), metadata)
       console.log('Text memory created successfully:', result)
-      
+
       // OPTIMISTIC UPDATE - Add memory to list immediately
       if (result && result.id) {
         const newMemory = {
@@ -1315,22 +1403,22 @@ function AppContent() {
           created_at: result.created_at || new Date().toISOString(),
           tags: selectedTags
         }
-        
+
         // Add to the beginning of the list
         setMemories(prev => [newMemory, ...prev])
-        
+
         // Update pagination
         setMemoryPagination(prev => ({
           ...prev,
           total: prev.total + 1
         }))
       }
-      
+
       // Refresh to get the latest state from backend
       fetchMemories()
       // Always reload calendar data after memory upload (force refresh to get new memory)
       fetchCalendarData(calendarDate, true)
-      
+
       // Reset memory form
       setMemoryTitle(null)
       setHasEditedTitle(false)
@@ -1339,7 +1427,7 @@ function AppContent() {
       setMemoryMood(null)
       setMemoryPeople('')
       setSelectedTags([])
-      
+
       showToast('Text memory created successfully!', 'success')
       setCurrentScreen(SCREENS.MAIN)
     } catch (err) {
@@ -1354,11 +1442,11 @@ function AppContent() {
       showToast('Please enter a tag name', 'error')
       return
     }
-    
+
     try {
       const tag = await api.createTag(newTagName.trim(), newTagColor)
       setTags(prev => [...prev, tag])
-      
+
       // Auto-select the newly created tag
       setSelectedTags(prev => {
         const exists = prev.find(t => t.id === tag.id)
@@ -1367,7 +1455,7 @@ function AppContent() {
         }
         return prev
       })
-      
+
       setNewTagName('')
       setNewTagColor('#10a37f')
       setShowTagModal(false)
@@ -1386,40 +1474,40 @@ function AppContent() {
       cancelText: 'Cancel',
       type: 'warning'
     })
-    
+
     if (!confirmed) {
       return
     }
-    
+
     // Store tag for potential rollback
     const tagToDelete = tags.find(t => t.id === tagId)
-    
+
     // OPTIMISTIC UPDATE - Remove from UI immediately
     setTags(prev => prev.filter(t => t.id !== tagId))
-    
+
     // Remove from selected tags if it was selected
     setSelectedTags(prev => prev.filter(t => t.id !== tagId))
-    
+
     // Clear filter if this tag was in the filter
     if (selectedFilterTags.find(t => t.id === tagId)) {
       setSelectedFilterTags(prev => prev.filter(t => t.id !== tagId))
       fetchMemories({ tag_ids: selectedFilterTags.filter(t => t.id !== tagId).map(t => t.id) })
     }
-    
+
     try {
       await api.deleteTag(tagId)
       showToast('Tag deleted successfully', 'success')
-      
+
       // Refresh memories to update tag associations
       fetchMemories()
     } catch (err) {
       console.error('Failed to delete tag:', err)
       setErrorMessage(`Failed to delete tag: ${err.message}`)
       showToast('Failed to delete tag', 'error')
-      
+
       // ROLLBACK - Restore the tag if API call failed
       if (tagToDelete) {
-        setTags(prev => [...prev, tagToDelete].sort((a, b) => 
+        setTags(prev => [...prev, tagToDelete].sort((a, b) =>
           a.name.localeCompare(b.name)
         ))
       }
@@ -1447,16 +1535,16 @@ function AppContent() {
     setIsPlaying(false)
     setCurrentPlaybackTime(0)
     setAudioUrl(null)
-    
+
     // Close sidebar on mobile
     if (window.innerWidth < 1024) setSidebarOpen(false)
-    
+
     // Load full details in the background
     try {
       // Fetch full memory details from API
       const fullMemory = await api.getMemory(memory.id)
       setSelectedMemory(fullMemory)
-      
+
       // Set up audio URL if available - always fetch fresh signed URL from backend
       if ((fullMemory.media_type === 'audio' || fullMemory.media_type === 'video')) {
         // Always fetch a fresh signed URL from the backend to ensure it's valid and not expired
@@ -1464,20 +1552,20 @@ function AppContent() {
           console.log('🔗 Fetching signed URL for memory:', fullMemory.id)
           const signedUrlResponse = await api.getMemoryAudioUrl(fullMemory.id)
           // Handle different response formats
-          const signedUrl = typeof signedUrlResponse === 'string' 
-            ? signedUrlResponse 
+          const signedUrl = typeof signedUrlResponse === 'string'
+            ? signedUrlResponse
             : (signedUrlResponse?.url || signedUrlResponse?.signed_url || signedUrlResponse?.presigned_url)
-          
+
           if (signedUrl) {
             console.log('✅ Signed URL obtained successfully')
             setAudioUrl(signedUrl)
           } else {
             console.warn('⚠️ No signed URL in response, checking for fallback options')
             // Fallback: check if memory object has a URL (might be a direct URL)
-            const fallbackUrl = fullMemory.audio_url || 
-                               fullMemory.signed_url || 
-                               fullMemory.presigned_url || 
-                               fullMemory.url
+            const fallbackUrl = fullMemory.audio_url ||
+              fullMemory.signed_url ||
+              fullMemory.presigned_url ||
+              fullMemory.url
             if (fallbackUrl) {
               console.warn('⚠️ Using fallback URL from memory object')
               setAudioUrl(fallbackUrl)
@@ -1489,10 +1577,10 @@ function AppContent() {
         } catch (err) {
           console.error('❌ Failed to get signed URL:', err)
           // Fallback: check if memory object has a URL
-          const fallbackUrl = fullMemory.audio_url || 
-                             fullMemory.signed_url || 
-                             fullMemory.presigned_url || 
-                             fullMemory.url
+          const fallbackUrl = fullMemory.audio_url ||
+            fullMemory.signed_url ||
+            fullMemory.presigned_url ||
+            fullMemory.url
           if (fallbackUrl) {
             console.warn('⚠️ Using fallback URL from memory object after error')
             setAudioUrl(fallbackUrl)
@@ -1502,7 +1590,7 @@ function AppContent() {
           }
         }
       }
-      
+
       // Set metadata
       setMemoryTitle(fullMemory.title || null)
       setHasEditedTitle(false)
@@ -1513,7 +1601,7 @@ function AppContent() {
       setMemoryDate(fullMemory.memory_date || '')
       setSelectedTags(fullMemory.tags || [])
       setEditingMemory(false)
-      
+
       // Fetch transcript for audio/video memories if status is completed
       if ((fullMemory.media_type === 'audio' || fullMemory.media_type === 'video') && fullMemory.status === 'completed') {
         setLoadingTranscript(true)
@@ -1533,7 +1621,7 @@ function AppContent() {
           setLoadingTranscript(false)
         }
       }
-      
+
       // Fetch text content for text memories if source_key exists
       if (fullMemory.media_type === 'text' && fullMemory.source_key && fullMemory.status === 'completed') {
         setLoadingTranscript(true)
@@ -1565,7 +1653,7 @@ function AppContent() {
 
   const updateMemoryMetadata = async () => {
     if (!selectedMemory) return
-    
+
     try {
       const updateData = {
         title: memoryTitle.trim(),
@@ -1576,12 +1664,12 @@ function AppContent() {
         memory_date: memoryDate || undefined,
         tag_ids: selectedTags.map(t => t.id)
       }
-      
+
       const updated = await api.updateMemory(selectedMemory.id, updateData)
-      
+
       // Update local state
       setMemories(prev => prev.map(m => m.id === updated.id ? updated : m))
-      
+
       setShowMemoryDetailModal(false)
       setEditingMemory(false)
       showToast('Memory updated successfully!', 'success')
@@ -1600,18 +1688,18 @@ function AppContent() {
       cancelText: 'Cancel',
       type: 'danger'
     })
-    
+
     if (!confirmed) {
       return
     }
-    
+
     // Store memory for potential rollback
     const memoryToDelete = memories.find(m => m.id === memoryId)
-    
+
     // OPTIMISTIC UPDATE
     setMemories(prev => prev.filter(m => m.id !== memoryId))
     setShowMemoryDetailModal(false)
-    
+
     try {
       await api.deleteMemory(memoryId)
       showToast('Memory deleted successfully', 'success')
@@ -1620,7 +1708,7 @@ function AppContent() {
       console.error('Failed to delete memory:', err)
       setErrorMessage(`Failed to delete memory: ${err.message}`)
       showToast('Failed to delete memory', 'error')
-      
+
       // ROLLBACK
       if (memoryToDelete) {
         setMemories(prev => [...prev, memoryToDelete])
@@ -1630,8 +1718,23 @@ function AppContent() {
 
   const askQuestion = async () => {
     if (!inputQuery.trim()) return
+
+    // Track guest messages and show centered modal after 4 messages (before 5th attempt)
+    if (!user && !authLoading) {
+      const currentCount = guestMessageCount
+
+      // Check if we should show the centered modal (after 4 messages, before 5th)
+      if (currentCount >= 4 && !loginPromptCooldownActive) {
+        setShowCenteredModal(true)
+        // Don't block the message, just show the modal
+      }
+
+      // Increment message count for guests
+      setGuestMessageCount(prev => prev + 1)
+    }
+
     if (!(await requireAuth('ask'))) return
-    
+
     // Resolve conversation id: use current or create (without navigating) so we can set user message before navigation
     let conversationIdToUse = currentConversationId
     if (!conversationIdToUse) {
@@ -1651,7 +1754,7 @@ function AppContent() {
       setCurrentScreen(SCREENS.MAIN)
       navigate(`/conversation/${createdId}`)
     }
-    
+
     const userMsg = { role: 'user', content: inputQuery }
     if (conversationIdToUse === currentConversationId) {
       // We're in an existing conversation: append user message to list
@@ -1661,27 +1764,32 @@ function AppContent() {
     setInputQuery('')
     setIsThinking(true)
     setErrorMessage('')
-    
+
     try {
       // Save user message to conversation
       console.log('Saving user message to conversation:', conversationIdToUse)
       await api.addMessageToConversation(conversationIdToUse, 'user', currentQuery)
-      
+
       // Get AI response
       const data = await api.askQuestion(currentQuery)
       const answer = data.answer || data
-      
+
       // Save assistant response to conversation
       console.log('Saving assistant response to conversation:', conversationIdToUse)
       await api.addMessageToConversation(conversationIdToUse, 'assistant', answer)
-      
+
       setMessages(prev => [...prev, { role: 'assistant', content: answer, sources: [] }])
-      
+
       // Refresh conversations list to update message count
       fetchConversations()
     } catch (err) {
       console.error('Error in askQuestion:', err)
-      setErrorMessage('Error getting response.')
+      if (err.guestLimitReached) {
+        setShowLoginModal(true)
+        showToast('Sign in to continue with more conversations', 'info')
+      } else {
+        setErrorMessage('Error getting response.')
+      }
     } finally {
       setIsThinking(false)
       skipLoadForConversationIdRef.current = null
@@ -1689,28 +1797,12 @@ function AppContent() {
   }
 
   const fetchMemories = async (customFilters = {}) => {
-    if (!user) {
-      console.log('fetchMemories: No user, skipping')
+    if (authLoading) {
       setMemoriesLoading(false)
       return
     }
-    
-    // Don't fetch if auth is still loading
-    if (authLoading) {
-      console.log('fetchMemories: Auth still loading, skipping')
-      return
-    }
-    
     try {
       setMemoriesLoading(true)
-      // Use cached token if available, otherwise get a new one
-      const token = authToken || await getIdToken(user, false)
-      if (!token) {
-        console.warn('fetchMemories: No token available')
-        setMemoriesLoading(false)
-        return
-      }
-      
       // Build filters from state or custom filters
       const filters = {
         page: customFilters.page || memoryPagination.page,
@@ -1722,17 +1814,17 @@ function AppContent() {
         topic: customFilters.topic !== undefined ? customFilters.topic : memoryTopicFilter,
         tag_ids: customFilters.tag_ids !== undefined ? customFilters.tag_ids : (selectedFilterTags.length > 0 ? selectedFilterTags.map(t => t.id) : null),
       }
-      
+
       console.log('fetchMemories: Fetching with filters:', filters)
       const data = await api.listMemories(filters)
-      
+
       // Sort by created_at descending (newest first) to ensure new memories appear at top
       const sortedMemories = (data.items || []).sort((a, b) => {
         const dateA = new Date(a.created_at || a.memory_date || 0)
         const dateB = new Date(b.created_at || b.memory_date || 0)
         return dateB - dateA
       })
-      
+
       setMemories(sortedMemories)
       setMemoryPagination({
         total: data.total || 0,
@@ -1750,20 +1842,7 @@ function AppContent() {
   }
 
   const fetchTags = async () => {
-    if (!user) {
-      console.log('fetchTags: No user, skipping')
-      return
-    }
-    
     try {
-      const token = await getIdToken(user, false)
-      if (!token) {
-        console.warn('fetchTags: No token available, waiting...')
-        setTimeout(() => fetchTags(), 1000)
-        return
-      }
-      
-      console.log('fetchTags: Token available, fetching tags...')
       const data = await api.listTags()
       setTags(data || [])
     } catch (err) {
@@ -1772,20 +1851,7 @@ function AppContent() {
   }
 
   const fetchConversations = async () => {
-    if (!user) {
-      console.log('fetchConversations: No user, skipping')
-      return
-    }
-    
     try {
-      // Use cached token if available, otherwise get a new one
-      const token = authToken || await getIdToken(user, false)
-      if (!token) {
-        console.warn('fetchConversations: No token available')
-        return
-      }
-      
-      console.log('fetchConversations: Token available, fetching conversations...')
       const data = await api.listConversations(0, 100)
       console.log('Conversations fetched:', data)
       setConversations(data || [])
@@ -1798,12 +1864,12 @@ function AppContent() {
 
 
   // --- TOAST NOTIFICATION HELPER ---
-  
+
   const showToast = (message, type = 'success') => {
     const id = Date.now()
     const newToast = { id, message, type }
     setToasts(prev => [...prev, newToast])
-    
+
     // Auto-remove after 3 seconds
     setTimeout(() => {
       setToasts(prev => prev.filter(t => t.id !== id))
@@ -1811,27 +1877,27 @@ function AppContent() {
   }
 
   // --- CALENDAR HELPER FUNCTIONS ---
-  
+
   const fetchCalendarData = async (date, forceRefresh = false) => {
     if (!user) return
-    
+
     try {
       const year = date.getFullYear()
       const month = date.getMonth()
-      
+
       // Create a unique key for this month (YYYY-MM)
       const monthKey = `${year}-${String(month + 1).padStart(2, '0')}`
-      
+
       // Check if we already have data for this month and don't need to refresh
       if (!forceRefresh && loadedCalendarMonths.has(monthKey)) {
         console.log('Calendar data already loaded for month:', monthKey)
         return
       }
-      
+
       // Get first and last day of month
       const firstDay = new Date(year, month, 1)
       const lastDay = new Date(year, month + 1, 0)
-      
+
       // Format dates as YYYY-MM-DD (using local time, consistent with getEmojiForDate)
       const formatDateLocal = (date) => {
         const year = date.getFullYear()
@@ -1839,52 +1905,52 @@ function AppContent() {
         const day = String(date.getDate()).padStart(2, '0')
         return `${year}-${month}-${day}`
       }
-      
+
       const start_date = formatDateLocal(firstDay)
       const end_date = formatDateLocal(lastDay)
-      
+
       console.log('Fetching memories for calendar:', start_date, 'to', end_date)
-      
+
       // Fetch memories - get all pages if needed
       let allMemories = []
       let page = 1
       const pageSize = 100
       let hasMore = true
-      
+
       while (hasMore) {
         const filters = {
           page: page,
           page_size: pageSize,
         }
-        
+
         const data = await api.listMemories(filters)
         const memories = data.items || []
         allMemories = [...allMemories, ...memories]
-        
+
         // Check if there are more pages
         hasMore = memories.length === pageSize && page < 10 // Safety limit of 10 pages
         page++
       }
-      
+
       const memoriesList = allMemories
       console.log(`Fetched ${memoriesList.length} total memories for calendar`)
-      
+
       // Group memories by date (YYYY-MM-DD) - merge with existing data
       setCalendarActivity(prevActivity => {
         const activityByDate = { ...prevActivity }
-        
+
         memoriesList.forEach(memory => {
           // Use memory_date if available, otherwise use created_at
           const memoryDate = memory.memory_date || memory.created_at
           if (!memoryDate) return
-          
+
           // Convert to local date and format as YYYY-MM-DD (consistent with getEmojiForDate)
           const date = new Date(memoryDate)
           const year = date.getFullYear()
           const month = String(date.getMonth() + 1).padStart(2, '0')
           const day = String(date.getDate()).padStart(2, '0')
           const dateStr = `${year}-${month}-${day}`
-          
+
           // Check if date is within the month range (compare as strings)
           if (dateStr >= start_date && dateStr <= end_date) {
             if (!activityByDate[dateStr]) {
@@ -1900,77 +1966,81 @@ function AppContent() {
             }
           }
         })
-        
+
         console.log('Calendar activity data updated for month:', monthKey)
         return activityByDate
       })
-      
+
       // Mark this month as loaded
       setLoadedCalendarMonths(prev => new Set([...prev, monthKey]))
     } catch (err) {
       console.error('Error fetching calendar data:', err)
     }
   }
-  
+
   const getCalendarDays = (date) => {
     const year = date.getFullYear()
     const month = date.getMonth()
     const firstDay = new Date(year, month, 1)
+    const startingDayOfWeek = firstDay.getDay()
+
+    const days = []
+
+    // Add days from previous month
+    const prevMonthLastDay = new Date(year, month, 0).getDate()
+    for (let i = startingDayOfWeek - 1; i >= 0; i--) {
+      days.push(new Date(year, month - 1, prevMonthLastDay - i))
+    }
+
+    // Add all days of current month
     const lastDay = new Date(year, month + 1, 0)
     const daysInMonth = lastDay.getDate()
-    const startingDayOfWeek = firstDay.getDay()
-    
-    const days = []
-    
-    // Add empty cells for days before month starts
-    for (let i = 0; i < startingDayOfWeek; i++) {
-      days.push(null)
-    }
-    
-    // Add all days of the month
     for (let day = 1; day <= daysInMonth; day++) {
       days.push(new Date(year, month, day))
     }
-    
+
+    // Add days from next month to fill 42 cells (6 rows)
+    const totalCells = 42
+    const remainingCells = totalCells - days.length
+    for (let day = 1; day <= remainingCells; day++) {
+      days.push(new Date(year, month + 1, day))
+    }
+
     return days
   }
-  
-  const getEmojiForDate = (date) => {
-    if (!date) return null
-    
+
+  const getEmojisForDate = (date) => {
+    if (!date) return []
+
     // Format date as YYYY-MM-DD without timezone conversion
     const year = date.getFullYear()
-    const month = String(date.getMonth() + 1).padStart(2, '0')  
+    const month = String(date.getMonth() + 1).padStart(2, '0')
     const day = String(date.getDate()).padStart(2, '0')
     const dateStr = `${year}-${month}-${day}`
-    
+
     const dayActivity = calendarActivity[dateStr]
-    
+
     if (!dayActivity || !dayActivity.memories || dayActivity.memories.length === 0) {
-      return null
+      return []
     }
-    
-    // Calculate average mood for the day
+
     const memories = dayActivity.memories
-    const memoriesWithMood = memories.filter(m => m.mood && m.mood >= 1 && m.mood <= 5)
-    
-    if (memoriesWithMood.length > 0) {
-      // Calculate average mood
-      const sum = memoriesWithMood.reduce((acc, m) => acc + m.mood, 0)
-      const average = sum / memoriesWithMood.length
-      // Round to nearest integer (1-5)
-      const averageMood = Math.round(average)
-      
-      // Map mood (1-5) to emojis: 😢 😕 😐 🙂 😄
-      const moodEmojis = ['😢', '😕', '😐', '🙂', '😄']
-      const emojiIndex = Math.min(Math.max(averageMood - 1, 0), 4)
-      return moodEmojis[emojiIndex]
+    const moodEmojis = ['😢', '😕', '😐', '🙂', '😄']
+
+    // Get moods from memories
+    const moods = memories
+      .filter(m => m.mood && m.mood >= 1 && m.mood <= 5)
+      .map(m => moodEmojis[m.mood - 1])
+
+    if (moods.length > 0) {
+      // Return unique moods, up to 2
+      return [...new Set(moods)].slice(0, 2)
     }
-    
+
     // Default emoji if no mood is set
-    return '📝'
+    return ['📝']
   }
-  
+
   const isToday = (date) => {
     if (!date) return false
     const today = new Date()
@@ -1981,18 +2051,18 @@ function AppContent() {
   const groupConversationsByDate = (conversations) => {
     const today = new Date()
     today.setHours(0, 0, 0, 0)
-    
+
     const yesterday = new Date(today)
     yesterday.setDate(yesterday.getDate() - 1)
-    
+
     const thisWeekStart = new Date(today)
     thisWeekStart.setDate(today.getDate() - today.getDay())
-    
+
     const lastWeekStart = new Date(thisWeekStart)
     lastWeekStart.setDate(lastWeekStart.getDate() - 7)
     const lastWeekEnd = new Date(thisWeekStart)
     lastWeekEnd.setDate(lastWeekEnd.getDate() - 1)
-    
+
     const groups = {
       'Today': [],
       'Yesterday': [],
@@ -2000,11 +2070,11 @@ function AppContent() {
       'Last Week': [],
       'Older': []
     }
-    
+
     conversations.forEach(conv => {
       const convDate = new Date(conv.updated_at || conv.created_at)
       convDate.setHours(0, 0, 0, 0)
-      
+
       if (convDate.getTime() === today.getTime()) {
         groups['Today'].push(conv)
       } else if (convDate.getTime() === yesterday.getTime()) {
@@ -2017,13 +2087,13 @@ function AppContent() {
         groups['Older'].push(conv)
       }
     })
-    
+
     // Return only groups that have conversations
     return Object.entries(groups)
       .filter(([_, convs]) => convs.length > 0)
       .map(([label, convs]) => ({ label, conversations: convs }))
   }
-  
+
   const changeMonth = (direction) => {
     setCalendarDate(prev => {
       const newDate = new Date(prev)
@@ -2036,26 +2106,26 @@ function AppContent() {
 
   const handleDateClick = async (date) => {
     if (!date) return
-    
+
     // Format date as YYYY-MM-DD
     const year = date.getFullYear()
     const month = String(date.getMonth() + 1).padStart(2, '0')
     const day = String(date.getDate()).padStart(2, '0')
     const dateStr = `${year}-${month}-${day}`
-    
+
     // Check if there's activity on this date
     const dayActivity = calendarActivity[dateStr]
     if (!dayActivity || !dayActivity.memories || dayActivity.memories.length === 0) {
       return
     }
-    
+
     // Format details from memories
     const details = {
       date: dateStr,
       memories: dayActivity.memories,
       total_count: dayActivity.memories.length
     }
-    
+
     console.log('Date details:', details)
     setSelectedDateDetails(details)
     setShowDateDetailsModal(true)
@@ -2066,7 +2136,7 @@ function AppContent() {
   const sidebarJSX = (
     <>
       {sidebarOpen && (
-        <div 
+        <div
           className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[60] lg:hidden"
           onClick={() => setSidebarOpen(false)}
         />
@@ -2079,35 +2149,54 @@ function AppContent() {
       `}>
         <div className="p-4 lg:p-3 flex flex-col h-full overflow-hidden">
           <div className={`flex items-center ${sidebarOpen ? 'justify-between' : 'lg:justify-center'} mb-6 px-2`}>
-            <div className={`flex items-center gap-3 ${!sidebarOpen && 'lg:hidden'}`}>
-              <div className="w-10 h-10 bg-gradient-to-br from-[#10a37f] to-[#0d8a6a] rounded-xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/30 flex-shrink-0">
-                <svg className="w-6 h-6" viewBox="0 0 24 24" fill="none"><path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><circle cx="8.5" cy="10.5" r="1.5" fill="currentColor"/><circle cx="12" cy="10.5" r="1.5" fill="currentColor"/><circle cx="15.5" cy="10.5" r="1.5" fill="currentColor"/></svg>
+            <button
+              onClick={() => setSidebarOpen(!sidebarOpen)}
+              className="flex items-center gap-3 group transition-all"
+              title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+            >
+              <div className={`flex items-center gap-3 ${!sidebarOpen && 'lg:hidden'}`}>
+                <div className="w-10 h-10 bg-gradient-to-br from-[#10a37f] to-[#0d8a6a] rounded-xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/30 flex-shrink-0 group-hover:scale-105 transition-transform">
+                  <svg className="w-6 h-6" viewBox="0 0 24 24" fill="none"><path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><circle cx="8.5" cy="10.5" r="1.5" fill="currentColor" /><circle cx="12" cy="10.5" r="1.5" fill="currentColor" /><circle cx="15.5" cy="10.5" r="1.5" fill="currentColor" /></svg>
+                </div>
+                <span className="font-bold text-lg tracking-tight dark:text-white">Zentra Journal</span>
               </div>
-              <span className="font-bold text-lg tracking-tight dark:text-white">Zentra Journal</span>
-            </div>
-            <div className={`hidden ${!sidebarOpen && 'lg:flex'} items-center justify-center`}>
-              <div className="w-10 h-10 bg-gradient-to-br from-[#10a37f] to-[#0d8a6a] rounded-xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/30">
-                <svg className="w-6 h-6" viewBox="0 0 24 24" fill="none"><path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><circle cx="8.5" cy="10.5" r="1.5" fill="currentColor"/><circle cx="12" cy="10.5" r="1.5" fill="currentColor"/><circle cx="15.5" cy="10.5" r="1.5" fill="currentColor"/></svg>
+              <div className={`hidden ${!sidebarOpen && 'lg:flex'} items-center justify-center`}>
+                <div className="w-10 h-10 bg-gradient-to-br from-[#10a37f] to-[#0d8a6a] rounded-xl flex items-center justify-center text-white shadow-lg shadow-[#10a37f]/30 group-hover:scale-105 transition-transform">
+                  <svg className="w-6 h-6" viewBox="0 0 24 24" fill="none"><path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><circle cx="8.5" cy="10.5" r="1.5" fill="currentColor" /><circle cx="12" cy="10.5" r="1.5" fill="currentColor" /><circle cx="15.5" cy="10.5" r="1.5" fill="currentColor" /></svg>
+                </div>
               </div>
-            </div>
+            </button>
             <button onClick={() => setSidebarOpen(false)} className="lg:hidden p-2 hover:bg-slate-200 dark:hover:bg-white/10 rounded-lg transition-colors">
               <svg className="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
             </button>
           </div>
 
           <div className="space-y-2 mb-6">
-            <button onClick={() => { createNewConversation(); if(window.innerWidth < 1024) setSidebarOpen(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-slate-50 dark:hover:bg-white/10 transition-all text-sm font-semibold active:scale-[0.98] ${!sidebarOpen && 'lg:justify-center lg:px-0'}`} title="New Chat"><svg className="w-5 h-5 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg><span className={`${!sidebarOpen && 'lg:hidden'}`}>New Chat</span></button>
-            
-            <input 
-              ref={fileInputRef} 
-              type="file" 
-              accept="audio/*,video/*" 
-              onChange={handleFileSelect} 
+            <button onClick={() => { createNewConversation(); if (window.innerWidth < 1024) setSidebarOpen(false); }} className={`w-full flex items-center gap-3 px-3 py-2.5 bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-slate-50 dark:hover:bg-white/10 transition-all text-sm font-semibold active:scale-[0.98] ${!sidebarOpen && 'lg:justify-center lg:px-0'}`} title="New Chat"><svg className="w-5 h-5 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg><span className={`${!sidebarOpen && 'lg:hidden'}`}>New Chat</span></button>
+            <button
+              onClick={() => {
+                setCurrentScreen(SCREENS.CALENDAR)
+                if (window.innerWidth < 1024) setSidebarOpen(false)
+              }}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-slate-50 dark:hover:bg-white/10 transition-all text-sm font-semibold active:scale-[0.98] ${currentScreen === SCREENS.CALENDAR ? 'bg-[#10a37f]/10 border-[#10a37f]/30 text-[#10a37f]' : ''} ${!sidebarOpen && 'lg:justify-center lg:px-0'}`}
+              title="Calendar"
+            >
+              <svg className="w-5 h-5 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+              </svg>
+              <span className={`${!sidebarOpen && 'lg:hidden'}`}>Calendar</span>
+            </button>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="audio/*,video/*"
+              onChange={handleFileSelect}
               className="hidden"
               style={{ zIndex: 1001 }}
             />
           </div>
-          
+
           <div className={`flex-1 overflow-y-auto custom-scrollbar ${!sidebarOpen && 'lg:hidden'} py-4`}>
             <div className="px-2 mb-6">
               <p className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest px-2 mb-2">Conversations</p>
@@ -2119,23 +2208,20 @@ function AppContent() {
                         {group.label}
                       </p>
                       {group.conversations.map((conv) => (
-                        <div 
-                          key={conv.id} 
+                        <div
+                          key={conv.id}
                           onClick={() => editingConversationId !== conv.id && loadConversation(conv)}
-                          className={`group flex items-center justify-between p-2 rounded-xl hover:bg-white dark:hover:bg-white/5 border transition-all ${
-                            editingConversationId === conv.id ? 'cursor-default' : 'cursor-pointer'
-                          } ${
-                            currentConversationId === conv.id 
-                              ? 'bg-[#10a37f]/10 border-[#10a37f]/30' 
+                          className={`group flex items-center justify-between p-2 rounded-xl hover:bg-white dark:hover:bg-white/5 border transition-all ${editingConversationId === conv.id ? 'cursor-default' : 'cursor-pointer'
+                            } ${currentConversationId === conv.id
+                              ? 'bg-[#10a37f]/10 border-[#10a37f]/30'
                               : 'border-transparent hover:border-slate-200 dark:hover:border-white/10'
-                          }`}
+                            }`}
                         >
                           <div className="flex items-center gap-3 min-w-0 flex-1">
-                            <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                              currentConversationId === conv.id 
-                                ? 'bg-[#10a37f] text-white' 
-                                : 'bg-blue-500/10 text-blue-500'
-                            }`}>
+                            <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${currentConversationId === conv.id
+                              ? 'bg-[#10a37f] text-white'
+                              : 'bg-blue-500/10 text-blue-500'
+                              }`}>
                               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
                             </div>
                             <div className="min-w-0 flex-1">
@@ -2150,7 +2236,7 @@ function AppContent() {
                                     if (e.key === 'Escape') cancelEditingConversation()
                                   }}
                                   onClick={(e) => e.stopPropagation()}
-                                  className="w-full text-xs font-semibold dark:text-white bg-white dark:bg-slate-800 border border-[#10a37f] rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-[#10a37f]"
+                                  className="w-full text-xs font-semibold dark:text-white bg-white dark:bg-slate-800 border-2 border-[#10a37f]/50 rounded-lg px-2 py-1 focus:outline-none focus:border-[#10a37f] transition-all shadow-sm"
                                   autoFocus
                                 />
                               ) : (
@@ -2195,10 +2281,30 @@ function AppContent() {
 
           </div>
 
+          {/* Sidebar Toggle - Visible on desktop */}
+          <div className="mt-2 mb-2">
+            <button
+              onClick={() => setSidebarOpen(!sidebarOpen)}
+              className="hidden lg:flex items-center gap-3 p-2 w-full rounded-xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors text-slate-400 hover:text-[#10a37f]"
+              title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+            >
+              <div className="w-9 h-9 flex items-center justify-center">
+                {sidebarOpen ? (
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7" /></svg>
+                ) : (
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7" /></svg>
+                )}
+              </div>
+              <span className={`text-sm font-medium ${!sidebarOpen && 'lg:hidden'}`}>
+                {sidebarOpen ? 'Collapse' : 'Expand'}
+              </span>
+            </button>
+          </div>
+
           <div className={`mt-auto pt-4 border-t border-slate-200 dark:border-white/10 ${!sidebarOpen && 'lg:border-0'}`}>
             {user ? (
               <div className="space-y-2">
-                <div 
+                <div
                   className={`flex items-center gap-3 p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors cursor-pointer ${!sidebarOpen && 'lg:justify-center'}`}
                   onClick={() => {
                     if (!sidebarOpen) {
@@ -2217,11 +2323,57 @@ function AppContent() {
                   </div>
                 </div>
                 {sidebarOpen && (
-                  <button onClick={handleSignOut} className="w-full flex items-center gap-3 px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-xl transition-all"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg><span>Sign Out</span></button>
+                  <>
+                    {authToken && (
+                      <div className="rounded-xl bg-slate-100 dark:bg-slate-800/50 p-2 text-xs">
+                        <div className="text-slate-500 dark:text-slate-400 mb-1 font-medium">Token</div>
+                        <code className="block text-slate-600 dark:text-slate-300 break-all font-mono" title={authToken}>
+                          {authToken.length > 48 ? `${authToken.slice(0, 24)}…${authToken.slice(-24)}` : authToken}
+                        </code>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigator.clipboard.writeText(authToken)
+                            showToast('Token copied to clipboard', 'success')
+                          }}
+                          className="mt-2 w-full py-1.5 px-2 text-[#10a37f] hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg text-xs font-medium transition-colors"
+                        >
+                          Copy token
+                        </button>
+                      </div>
+                    )}
+                    <button onClick={handleSignOut} className="w-full flex items-center gap-3 px-3 py-2 text-sm text-slate-500 dark:text-slate-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-xl transition-all"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg><span>Sign Out</span></button>
+                  </>
                 )}
               </div>
             ) : (
-              <button onClick={() => setShowLoginModal(true)} className={`w-full flex items-center gap-3 p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors ${!sidebarOpen && 'lg:justify-center'}`}><div className="w-9 h-9 rounded-full bg-slate-300 dark:bg-slate-700 flex items-center justify-center flex-shrink-0"><svg className="w-5 h-5 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg></div><div className={`flex-1 min-w-0 ${!sidebarOpen && 'lg:hidden'}`}><span className="block text-sm font-semibold dark:text-white">Sign In</span><span className="text-[10px] text-slate-500 dark:text-slate-400">Click to login</span></div></button>
+              <div className="space-y-2">
+                <button
+                  onClick={() => setShowLoginModal(true)}
+                  className={`w-full flex items-center gap-3 p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-white/5 transition-colors ${!sidebarOpen && 'lg:justify-center'}`}
+                >
+                  <div className="w-9 h-9 rounded-full bg-slate-300 dark:bg-slate-700 flex items-center justify-center flex-shrink-0">
+                    <svg className="w-5 h-5 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                    </svg>
+                  </div>
+                  <div className={`flex-1 min-w-0 ${!sidebarOpen && 'lg:hidden'}`}>
+                    <span className="block text-sm font-semibold dark:text-white">Sign In</span>
+                    <span className="text-[10px] text-slate-500 dark:text-slate-400">Click to login</span>
+                  </div>
+                </button>
+                {sidebarOpen && (
+                  <div className="px-3 py-2 rounded-xl bg-orange-500/5 border border-orange-500/10">
+                    <div className="flex items-center gap-2 mb-1">
+                      <div className="w-1.5 h-1.5 rounded-full bg-orange-500 animate-pulse" />
+                      <span className="text-[10px] font-bold text-orange-600 dark:text-orange-400 uppercase tracking-wider">Guest Session</span>
+                    </div>
+                    <code className="block text-[10px] text-slate-500 dark:text-slate-400 font-mono break-all opacity-70">
+                      ID: {getOrCreateGuestId().slice(0, 8)}...
+                    </code>
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </div>
@@ -2244,131 +2396,11 @@ function AppContent() {
       </div>
       <div className="flex items-center gap-2 lg:gap-3">
         <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-[#10a37f]/10 rounded-full"><div className="w-2 h-2 bg-[#10a37f] rounded-full animate-pulse"></div><span className="text-xs font-semibold text-[#10a37f]">Memory Active</span></div>
-        
-        {/* Calendar Dropdown Button */}
-        <div className="relative">
-          <button 
-            onClick={() => setShowCalendarDropdown(!showCalendarDropdown)} 
-            className={`p-2 rounded-lg transition-all ${showCalendarDropdown ? 'bg-[#10a37f]/10 text-[#10a37f]' : 'hover:bg-slate-100 dark:hover:bg-white/10 text-slate-400'}`}
-            title="Calendar"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-            </svg>
-          </button>
-          
-          {/* Calendar Dropdown */}
-          {showCalendarDropdown && (
-            <>
-              <div 
-                className="fixed inset-0 z-[60]" 
-                onClick={() => setShowCalendarDropdown(false)}
-              />
-              <div 
-                className="absolute right-0 mt-2 z-[70] animate-fade-in"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <div 
-                  className="bg-white dark:bg-[#171717] rounded-2xl border border-slate-200 dark:border-white/10 shadow-2xl p-5 w-80"
-                >
-                  {/* Calendar Header */}
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-base font-bold text-slate-800 dark:text-white">
-                      {calendarDate.toLocaleString('default', { month: 'long', year: 'numeric' })}
-                    </h3>
-                    <div className="flex gap-1">
-                      <button
-                        onClick={() => {
-                          const today = new Date()
-                          setCalendarDate(today)
-                          fetchCalendarData(today)
-                        }}
-                        className="px-2.5 py-1 text-xs font-semibold bg-[#10a37f] text-white rounded-lg hover:bg-[#0d8a6a] transition-colors"
-                        title="Go to today"
-                      >
-                        Today
-                      </button>
-                      <button
-                        onClick={() => changeMonth(-1)}
-                        className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors"
-                        title="Previous month"
-                      >
-                        <svg className="w-4 h-4 text-slate-600 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-                        </svg>
-                      </button>
-                      <button
-                        onClick={() => changeMonth(1)}
-                        className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors"
-                        title="Next month"
-                      >
-                        <svg className="w-4 h-4 text-slate-600 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                        </svg>
-                      </button>
-                    </div>
-                  </div>
-                  
-                  {/* Weekday Headers */}
-                  <div className="grid grid-cols-7 gap-2 mb-3">
-                    {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day, idx) => (
-                      <div key={idx} className="text-center text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase">
-                        {day}
-                      </div>
-                    ))}
-                  </div>
-                  
-                  {/* Calendar Grid */}
-                  <div className="grid grid-cols-7 gap-2">
-                    {getCalendarDays(calendarDate).map((date, idx) => {
-                      const emoji = date ? getEmojiForDate(date) : null
-                      const today = date && isToday(date)
-                      
-                      return (
-                        <div
-                          key={idx}
-                          onClick={() => handleDateClick(date)}
-                          className={`aspect-square flex flex-col items-center justify-center rounded-xl text-sm relative ${
-                            date 
-                              ? 'hover:bg-slate-100 dark:hover:bg-white/10 cursor-pointer transition-colors' 
-                              : ''
-                          } ${
-                            today 
-                              ? 'bg-[#10a37f] text-white font-bold shadow-lg' 
-                              : 'text-slate-700 dark:text-slate-300'
-                          } ${
-                            emoji 
-                              ? 'hover:scale-110 active:scale-95' 
-                              : ''
-                          }`}
-                        >
-                          {date && (
-                            <>
-                              <span className={`text-xs ${today ? 'font-bold' : ''}`}>
-                                {date.getDate()}
-                              </span>
-                              {emoji && (
-                                <span className="text-sm leading-none mt-1">
-                                  {emoji}
-                                </span>
-                              )}
-                            </>
-                          )}
-                        </div>
-                      )
-                    })}
-                  </div>
-                </div>
-              </div>
-            </>
-          )}
-        </div>
-        
-        <button 
-          onClick={() => { 
+        <button
+          onClick={() => {
             createNewConversation()
-            if(window.innerWidth < 1024) setSidebarOpen(false)
-          }} 
+            if (window.innerWidth < 1024) setSidebarOpen(false)
+          }}
           className="lg:hidden p-2 bg-[#10a37f] text-white rounded-lg active:scale-95 transition-transform hover:bg-[#0d8a6a]"
           title="New Chat"
         >
@@ -2379,230 +2411,6 @@ function AppContent() {
       </div>
     </header>
   )
-
-  const ToastContainer = () => {
-    return (
-      <div className="fixed bottom-4 right-4 z-[200] flex flex-col gap-2">
-        {toasts.map((toast) => (
-          <div
-            key={toast.id}
-            className={`px-4 py-3 rounded-xl shadow-2xl border backdrop-blur-sm animate-fade-in flex items-center gap-3 min-w-[300px] ${
-              toast.type === 'success' 
-                ? 'bg-green-500/90 border-green-600 text-white' 
-                : toast.type === 'error'
-                ? 'bg-red-500/90 border-red-600 text-white'
-                : 'bg-blue-500/90 border-blue-600 text-white'
-            }`}
-          >
-            {toast.type === 'success' && (
-              <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-              </svg>
-            )}
-            {toast.type === 'error' && (
-              <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            )}
-            {toast.type === 'info' && (
-              <svg className="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-            )}
-            <span className="font-medium text-sm">{toast.message}</span>
-          </div>
-        ))}
-      </div>
-    )
-  }
-
-  const DateDetailsModal = () => {
-    if (!showDateDetailsModal || !selectedDateDetails) return null
-    
-    return (
-      <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-        <div 
-          className="absolute inset-0 bg-black/60 backdrop-blur-sm" 
-          onClick={() => setShowDateDetailsModal(false)} 
-        />
-        <div className="relative w-full max-w-2xl bg-white dark:bg-[#171717] rounded-2xl shadow-2xl border border-slate-200 dark:border-white/10 max-h-[80vh] overflow-hidden animate-fade-in">
-          {/* Header */}
-          <div className="p-6 border-b border-slate-200 dark:border-white/10 flex items-center justify-between">
-            <div>
-              <h2 className="text-xl font-bold dark:text-white">
-                {new Date(selectedDateDetails.date).toLocaleDateString('default', { 
-                  weekday: 'long',
-                  year: 'numeric',
-                  month: 'long',
-                  day: 'numeric'
-                })}
-              </h2>
-              <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-                {selectedDateDetails.total_count} {selectedDateDetails.total_count === 1 ? 'item' : 'items'}
-              </p>
-            </div>
-            <button 
-              onClick={() => setShowDateDetailsModal(false)}
-              className="p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors"
-            >
-              <svg className="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
-          
-          {/* Content */}
-          <div className="p-6 overflow-y-auto max-h-[calc(80vh-120px)]">
-            {/* Memories */}
-            {selectedDateDetails.memories && selectedDateDetails.memories.length > 0 && (
-              <div>
-                <h3 className="text-sm font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                  <span>📝</span>
-                  Memories ({selectedDateDetails.memories.length})
-                </h3>
-                <div className="space-y-2">
-                  {selectedDateDetails.memories.map((memory) => (
-                    <div 
-                      key={memory.id}
-                      onClick={() => {
-                        viewMemoryDetail(memory)
-                        setShowDateDetailsModal(false)
-                        setShowCalendarDropdown(false)
-                      }}
-                      className="p-4 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10 hover:border-[#10a37f] dark:hover:border-[#10a37f] cursor-pointer transition-all hover:shadow-md"
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex items-start gap-3 flex-1 min-w-0">
-                          <div className={`w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                            memory.media_type === 'video' ? 'bg-blue-500/10 text-blue-500' :
-                            memory.media_type === 'text' ? 'bg-orange-500/10 text-orange-500' :
-                            'bg-purple-500/10 text-purple-500'
-                          }`}>
-                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              {memory.media_type === 'video' ? (
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                              ) : memory.media_type === 'text' ? (
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                              ) : (
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                              )}
-                            </svg>
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 mb-1">
-                              <h4 className="font-semibold text-slate-800 dark:text-white truncate">
-                                {memory.title || 'Untitled Memory'}
-                              </h4>
-                              {memory.mood && (
-                                <span className="text-sm flex-shrink-0">
-                                  {['😢', '😕', '😐', '🙂', '😄'][memory.mood - 1]}
-                                </span>
-                              )}
-                            </div>
-                            <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-2">
-                              {memory.description || memory.topic || 'No description'}
-                            </p>
-                            {memory.tags && memory.tags.length > 0 && (
-                              <div className="flex flex-wrap gap-1 mt-2">
-                                {memory.tags.slice(0, 3).map((tag) => (
-                                  <span 
-                                    key={tag.id}
-                                    className="text-[10px] px-2 py-0.5 rounded-full"
-                                    style={{ 
-                                      backgroundColor: `${tag.color}20`,
-                                      color: tag.color
-                                    }}
-                                  >
-                                    {tag.name}
-                                  </span>
-                                ))}
-                                {memory.tags.length > 3 && (
-                                  <span className="text-[10px] text-slate-400">+{memory.tags.length - 3}</span>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                        <div className="text-xs text-slate-400 flex-shrink-0">
-                          {new Date(memory.created_at || memory.memory_date).toLocaleTimeString('default', { 
-                            hour: '2-digit',
-                            minute: '2-digit'
-                          })}
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-            
-            {/* Legacy Recordings (keeping for backward compatibility if needed) */}
-            {selectedDateDetails.recordings && selectedDateDetails.recordings.length > 0 && (
-              <div>
-                <h3 className="text-sm font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
-                  <span>🎙️</span>
-                  Recordings ({selectedDateDetails.recordings.length})
-                </h3>
-                <div className="space-y-2">
-                  {selectedDateDetails.recordings.map((rec) => (
-                    <div 
-                      key={rec.id || rec.document_id}
-                      onClick={() => {
-                        viewMemoryDetail(rec)
-                        setShowDateDetailsModal(false)
-                        setShowCalendarDropdown(false)
-                      }}
-                      className="p-4 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10 hover:border-[#10a37f] dark:hover:border-[#10a37f] cursor-pointer transition-all hover:shadow-md"
-                    >
-                      <div className="flex items-start justify-between">
-                        <div className="flex-1">
-                          <h4 className="font-semibold text-slate-800 dark:text-white mb-1">
-                            {rec.filename}
-                          </h4>
-                          <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
-                            <span className={`px-2 py-0.5 rounded-full ${
-                              rec.status === 'indexed' 
-                                ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400'
-                                : 'bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400'
-                            }`}>
-                              {rec.status}
-                            </span>
-                            {rec.has_transcription && (
-                              <span className="flex items-center gap-1">
-                                <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
-                                  <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
-                                </svg>
-                                Transcribed
-                              </span>
-                            )}
-                            {rec.duration_seconds && (
-                              <span>{Math.floor(rec.duration_seconds / 60)}m {rec.duration_seconds % 60}s</span>
-                            )}
-                          </div>
-                        </div>
-                        <div className="text-xs text-slate-400">
-                          {new Date(rec.created_at).toLocaleTimeString('default', { 
-                            hour: '2-digit',
-                            minute: '2-digit'
-                          })}
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-            
-            {selectedDateDetails.total_count === 0 && (
-              <div className="text-center py-12">
-                <p className="text-slate-500 dark:text-slate-400">No activity on this date</p>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-    )
-  }
 
   // Helper function to show confirmation modal
   const showConfirmation = (config) => {
@@ -2626,327 +2434,84 @@ function AppContent() {
     })
   }
 
-  const ProfileDialog = () => {
-    if (!showProfileDialog || !user) return null
+  // Side Login Card - Shows by default when session starts
 
-    return (
-      <>
-        <div 
-          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[80]"
-          onClick={() => setShowProfileDialog(false)}
-        />
-        <div className="fixed bottom-4 left-4 z-[90] lg:left-20">
-          <div 
-            className="bg-white dark:bg-[#171717] rounded-2xl border border-slate-200 dark:border-white/10 shadow-2xl w-full max-w-sm p-6"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between mb-6">
-              <h3 className="text-lg font-bold text-slate-800 dark:text-white">Profile</h3>
-              <button
-                onClick={() => setShowProfileDialog(false)}
-                className="p-1.5 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors text-slate-400 hover:text-slate-600 dark:hover:text-white"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            
-            <div className="flex items-center gap-4 mb-6">
-              {user.photoURL && !imageError.has('profile') ? (
-                <img 
-                  src={user.photoURL} 
-                  alt={user.displayName || user.email} 
-                  className="w-16 h-16 rounded-full flex-shrink-0 object-cover border-2 border-slate-200 dark:border-white/10" 
-                  onError={() => setImageError(prev => new Set(prev).add('profile'))} 
-                />
-              ) : (
-                <div className="w-16 h-16 rounded-full bg-indigo-500 flex items-center justify-center text-lg text-white font-bold flex-shrink-0 border-2 border-slate-200 dark:border-white/10">
-                  {getUserInitials(user)}
-                </div>
-              )}
-              <div className="flex-1 min-w-0">
-                <p className="text-base font-semibold dark:text-white truncate">{user.displayName || user.email}</p>
-                <p className="text-sm text-slate-500 dark:text-slate-400 truncate">{user.email}</p>
-                <span className="inline-block mt-1 text-xs text-[#10a37f] font-semibold">Pro Plan</span>
-              </div>
-            </div>
+  // Centered Login Modal - Shows after 4th message with blur background
 
-            <div className="space-y-2">
-              <button 
-                onClick={handleSignOut} 
-                className="w-full flex items-center justify-center gap-2 px-4 py-3 text-sm text-white bg-red-500 hover:bg-red-600 rounded-xl transition-all font-semibold"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
-                </svg>
-                <span>Sign Out</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      </>
-    )
-  }
+  // Old Login Modal - Keep for legacy requireAuth blocking scenarios
 
-  const ConfirmationModal = () => {
-    if (!confirmationModal.show) return null
+  // Global Modals JSX
+  const globalModalsJSX = (
+    <GlobalModals
+      toasts={toasts}
+      showDateDetailsModal={showDateDetailsModal}
+      selectedDateDetails={selectedDateDetails}
+      setShowDateDetailsModal={setShowDateDetailsModal}
+      viewMemoryDetail={viewMemoryDetail}
+      showLoginModal={showLoginModal}
+      setShowLoginModal={setShowLoginModal}
+      setHasDismissedLoginPrompt={setHasDismissedLoginPrompt}
+      shouldShakeLogin={shouldShakeLogin}
+      handleGoogleSignIn={handleGoogleSignIn}
+      showSearchModal={showSearchModal}
+      setShowSearchModal={setShowSearchModal}
+      searchQuery={searchQuery}
+      setSearchQuery={setSearchQuery}
+      searchResults={searchResults}
+      isSearching={isSearching}
+      loadConversation={loadConversation}
+      confirmationModal={confirmationModal}
+      showProfileDialog={showProfileDialog}
+      setShowProfileDialog={setShowProfileDialog}
+      user={user}
+      imageError={imageError}
+      setImageError={setImageError}
+      getUserInitials={getUserInitials}
+      handleSignOut={handleSignOut}
+      authLoading={authLoading}
+      hasDismissedSideCard={hasDismissedSideCard}
+      setHasDismissedSideCard={setHasDismissedSideCard}
+      guestMessageCount={guestMessageCount}
+      showCenteredModal={showCenteredModal}
+      setShowCenteredModal={setShowCenteredModal}
+      setLoginPromptCooldownActive={setLoginPromptCooldownActive}
+      setModalDismissTime={setModalDismissTime}
+    />
+  )
 
-    const typeStyles = {
-      warning: {
-        icon: (
-          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-          </svg>
-        ),
-        iconBg: 'bg-yellow-100 dark:bg-yellow-900/30',
-        iconColor: 'text-yellow-600 dark:text-yellow-400',
-        buttonBg: 'bg-yellow-500 hover:bg-yellow-600',
-        border: 'border-yellow-200 dark:border-yellow-800'
-      },
-      danger: {
-        icon: (
-          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-        ),
-        iconBg: 'bg-red-100 dark:bg-red-900/30',
-        iconColor: 'text-red-600 dark:text-red-400',
-        buttonBg: 'bg-red-500 hover:bg-red-600',
-        border: 'border-red-200 dark:border-red-800'
-      },
-      info: {
-        icon: (
-          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-        ),
-        iconBg: 'bg-blue-100 dark:bg-blue-900/30',
-        iconColor: 'text-blue-600 dark:text-blue-400',
-        buttonBg: 'bg-blue-500 hover:bg-blue-600',
-        border: 'border-blue-200 dark:border-blue-800'
-      }
-    }
-
-    const styles = typeStyles[confirmationModal.type] || typeStyles.warning
-
-    return (
-      <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={confirmationModal.onCancel} />
-        <div className="relative w-full max-w-md bg-white dark:bg-[#171717] rounded-2xl shadow-2xl border border-slate-200 dark:border-white/10 p-6 animate-fade-in">
-          <div className="flex items-start gap-4">
-            <div className={`flex-shrink-0 w-12 h-12 ${styles.iconBg} ${styles.iconColor} rounded-xl flex items-center justify-center`}>
-              {styles.icon}
-            </div>
-            <div className="flex-1 min-w-0">
-              <h3 className="text-lg font-bold text-slate-800 dark:text-white mb-2">
-                {confirmationModal.title}
-              </h3>
-              <p className="text-sm text-slate-600 dark:text-slate-400 whitespace-pre-line">
-                {confirmationModal.message}
-              </p>
-            </div>
-          </div>
-          <div className="flex gap-3 mt-6">
-            <button
-              onClick={confirmationModal.onCancel}
-              className="flex-1 px-4 py-2.5 bg-slate-100 dark:bg-white/5 text-slate-700 dark:text-white font-semibold rounded-xl hover:bg-slate-200 dark:hover:bg-white/10 transition-colors"
-            >
-              {confirmationModal.cancelText}
-            </button>
-            <button
-              onClick={confirmationModal.onConfirm}
-              className={`flex-1 px-4 py-2.5 ${styles.buttonBg} text-white font-semibold rounded-xl transition-colors`}
-            >
-              {confirmationModal.confirmText}
-            </button>
-          </div>
-        </div>
-      </div>
-    )
-  }
-  
-  const LoginModal = () => {
-    if (!showLoginModal) return null
-    return (
-      <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setShowLoginModal(false)} />
-        <div className="relative w-full max-w-md bg-white dark:bg-[#171717] rounded-2xl shadow-2xl border border-slate-200 dark:border-white/10 p-8 animate-fade-in">
-          <button onClick={() => setShowLoginModal(false)} className="absolute top-4 right-4 p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors text-slate-400"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
-          <div className="w-16 h-16 bg-gradient-to-br from-[#10a37f] to-[#0d8a6a] rounded-2xl flex items-center justify-center mx-auto mb-6 text-white shadow-lg shadow-[#10a37f]/30"><svg className="w-8 h-8" viewBox="0 0 24 24" fill="none"><path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><circle cx="8.5" cy="10.5" r="1.5" fill="currentColor"/><circle cx="12" cy="10.5" r="1.5" fill="currentColor"/><circle cx="15.5" cy="10.5" r="1.5" fill="currentColor"/></svg></div>
-          <h2 className="text-2xl font-bold mb-2 text-center dark:text-white">Sign In Required</h2>
-          <p className="text-sm text-slate-500 dark:text-slate-400 text-center mb-6">Please sign in to record audio, upload files, and access your profile</p>
-          {errorMessage && (<div className="mb-4 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl"><p className="text-red-500 text-sm font-medium text-center">{errorMessage}</p></div>)}
-          <button onClick={handleGoogleSignIn} className="w-full flex items-center justify-center gap-3 px-6 py-4 bg-white dark:bg-[#1a1a1a] border-2 border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 dark:hover:bg-[#10a37f]/10 transition-all font-semibold shadow-lg active:scale-[0.98]"><svg className="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg><span>Continue with Google</span></button>
-        </div>
-      </div>
-    )
-  }
-
-  const SearchModal = () => {
-    if (!showSearchModal) return null
-    
-    const searchInputRef = useRef(null)
-    
-    // Focus input when modal opens
-    useEffect(() => {
-      if (showSearchModal && searchInputRef.current) {
-        setTimeout(() => searchInputRef.current?.focus(), 100)
-      }
-    }, [showSearchModal])
-
-    return (
-      <div className="fixed inset-0 z-[100] flex items-start justify-center pt-[10vh] p-4">
-        <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setShowSearchModal(false)} />
-        <div className="relative w-full max-w-2xl bg-white dark:bg-[#171717] rounded-2xl shadow-2xl border border-slate-200 dark:border-white/10 overflow-hidden animate-fade-in">
-          {/* Search Input */}
-          <div className="p-4 border-b border-slate-200 dark:border-white/10">
-            <div className="relative">
-              <input
-                ref={searchInputRef}
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search conversations and memories..."
-                className="w-full px-4 py-3 pl-10 pr-20 bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/10 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-[#10a37f] dark:text-white"
-              />
-              <svg className="w-5 h-5 absolute left-3 top-3.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-              </svg>
-              <div className="absolute right-3 top-2.5 flex items-center gap-1 text-xs text-slate-400">
-                <kbd className="px-2 py-1 bg-slate-100 dark:bg-white/10 rounded text-xs">Esc</kbd>
-                <span>to close</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Search Results */}
-          <div className="max-h-[60vh] overflow-y-auto custom-scrollbar">
-            {isSearching ? (
-              <div className="p-8 text-center">
-                <div className="w-8 h-8 border-2 border-[#10a37f] border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
-                <p className="text-sm text-slate-500 dark:text-slate-400">Searching...</p>
-              </div>
-            ) : searchQuery.trim() === '' ? (
-              <div className="p-8 text-center">
-                <p className="text-sm text-slate-500 dark:text-slate-400">Start typing to search conversations and memories</p>
-                <p className="text-xs text-slate-400 dark:text-slate-500 mt-2">Press <kbd className="px-1.5 py-0.5 bg-slate-100 dark:bg-white/10 rounded text-xs">⌘K</kbd> or <kbd className="px-1.5 py-0.5 bg-slate-100 dark:bg-white/10 rounded text-xs">Ctrl+K</kbd> to open this search</p>
-              </div>
-            ) : searchResults.conversations.length === 0 && searchResults.memories.length === 0 ? (
-              <div className="p-8 text-center">
-                <p className="text-sm text-slate-500 dark:text-slate-400">No results found</p>
-              </div>
-            ) : (
-              <div className="p-4 space-y-4">
-                {/* Conversations Results */}
-                {searchResults.conversations.length > 0 && (
-                  <div>
-                    <h3 className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-2 px-2">
-                      Conversations ({searchResults.conversations.length})
-                    </h3>
-                    <div className="space-y-1">
-                      {searchResults.conversations.map((conv) => (
-                        <button
-                          key={conv.id}
-                          onClick={() => {
-                            loadConversation(conv)
-                            setShowSearchModal(false)
-                            setSearchQuery('')
-                          }}
-                          className="w-full text-left p-3 rounded-xl hover:bg-slate-50 dark:hover:bg-white/5 border border-transparent hover:border-slate-200 dark:hover:border-white/10 transition-all"
-                        >
-                          <div className="flex items-center gap-3">
-                            <div className="w-8 h-8 rounded-lg bg-blue-500/10 text-blue-500 flex items-center justify-center flex-shrink-0">
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                              </svg>
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-semibold text-slate-800 dark:text-white truncate">
-                                {conv.title || 'Untitled Chat'}
-                              </p>
-                              <p className="text-xs text-slate-500 dark:text-slate-400">
-                                {conv.message_count || 0} messages
-                              </p>
-                            </div>
-                          </div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* Memories Results */}
-                {searchResults.memories.length > 0 && (
-                  <div>
-                    <h3 className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider mb-2 px-2">
-                      Memories ({searchResults.memories.length})
-                    </h3>
-                    <div className="space-y-1">
-                      {searchResults.memories.map((memory) => (
-                        <button
-                          key={memory.id}
-                          onClick={() => {
-                            viewMemoryDetail(memory)
-                            setShowSearchModal(false)
-                            setSearchQuery('')
-                          }}
-                          className="w-full text-left p-3 rounded-xl hover:bg-slate-50 dark:hover:bg-white/5 border border-transparent hover:border-slate-200 dark:hover:border-white/10 transition-all"
-                        >
-                          <div className="flex items-center gap-3">
-                            <div className="w-8 h-8 rounded-lg bg-[#10a37f]/10 text-[#10a37f] flex items-center justify-center flex-shrink-0">
-                              {memory.media_type === 'audio' && '🎵'}
-                              {memory.media_type === 'video' && '🎬'}
-                              {memory.media_type === 'text' && '📄'}
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-sm font-semibold text-slate-800 dark:text-white truncate">
-                                {memory.title || 'Untitled Memory'}
-                              </p>
-                              <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                                {memory.description || memory.topic || 'No description'}
-                              </p>
-                            </div>
-                          </div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-    )
-  }
+  // Main rendering logic
 
   // VIEW_MEMORY Screen - Full page view with audio player and transcription
   if (currentScreen === SCREENS.VIEW_MEMORY && selectedMemory) {
     return (
       <>
-        <ToastContainer />
-        <DateDetailsModal />
-        <LoginModal />
-        <SearchModal />
-        <ConfirmationModal />
-        <ProfileDialog />
-        <ConfirmationModal />
-        <ProfileDialog />
+        {globalModalsJSX}
         <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
           <div className="flex-1 flex flex-col min-w-0 h-[100dvh] overflow-hidden">
-            <header className="h-14 lg:h-16 border-b border-slate-200 dark:border-white/10 px-4 lg:px-6 flex items-center justify-between bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl">
+            <header className="h-14 lg:h-16 border-b border-slate-200 dark:border-white/10 px-4 lg:px-6 flex items-center justify-between bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl sticky top-0 z-40">
               <div className="flex items-center gap-3">
-                <button 
-                  onClick={() => { 
+                <button
+                  onClick={() => setSidebarOpen(!sidebarOpen)}
+                  className="p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors text-slate-500"
+                  title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+                >
+                  {sidebarOpen ? (
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7m8 14l-7-7 7-7" /></svg>
+                  ) : (
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
+                  )}
+                </button>
+                <div className="h-5 w-px bg-slate-200 dark:bg-white/10 mx-1 hidden sm:block" />
+                <button
+                  onClick={() => {
                     setCurrentScreen(SCREENS.MAIN)
                     setSelectedMemory(null)
                     setIsPlaying(false)
                     setActiveUtteranceIndex(null)
                     setCurrentPlaybackTime(0)
                     setAudioUrl(null)
-                  }} 
+                  }}
                   className="p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors text-slate-500"
                 >
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2975,9 +2540,9 @@ function AppContent() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
                   </svg>
                 </button>
-                <button 
-                  onClick={() => deleteMemory(selectedMemory.id)} 
-                  className="p-2 hover:bg-red-50 dark:hover:bg-red-500/10 text-slate-400 hover:text-red-500 rounded-lg transition-all" 
+                <button
+                  onClick={() => deleteMemory(selectedMemory.id)}
+                  className="p-2 hover:bg-red-50 dark:hover:bg-red-500/10 text-slate-400 hover:text-red-500 rounded-lg transition-all"
                   title="Delete memory"
                 >
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -3021,13 +2586,13 @@ function AppContent() {
                         )}
                       </h2>
                       <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-1">
-                        {selectedMemory.media_type === 'text' 
+                        {selectedMemory.media_type === 'text'
                           ? (selectedMemory.status === 'completed' ? 'Text content of the memory' : 'Text content will be available after processing')
                           : (selectedMemory.status === 'completed' ? 'Full transcript of the recording' : 'Transcription will be available after processing')
                         }
                       </p>
                     </div>
-                  
+
                     <div className="p-4 sm:p-6 pb-8 lg:pb-6 space-y-3 sm:space-y-4 max-h-[500px] sm:max-h-[600px] overflow-y-auto custom-scrollbar">
                       {loadingTranscript ? (
                         <div className="text-center py-12">
@@ -3052,15 +2617,14 @@ function AppContent() {
                           <p className="text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap">{selectedMemoryTranscript}</p>
                         ) : Array.isArray(selectedMemoryTranscript) ? (
                           selectedMemoryTranscript.map((segment, idx) => (
-                            <div 
-                              key={idx} 
+                            <div
+                              key={idx}
                               ref={activeUtteranceIndex === idx ? activeUtteranceRef : null}
                               onClick={() => segment.start && seekToTime(segment.start)}
-                              className={`p-3 sm:p-4 rounded-lg sm:rounded-xl border transition-all cursor-pointer ${
-                                activeUtteranceIndex === idx
-                                  ? 'bg-[#10a37f]/10 border-[#10a37f] shadow-lg scale-[1.01] sm:scale-[1.02]'
-                                  : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/10 active:bg-slate-100 dark:active:bg-white/10'
-                              }`}
+                              className={`p-3 sm:p-4 rounded-lg sm:rounded-xl border transition-all cursor-pointer ${activeUtteranceIndex === idx
+                                ? 'bg-[#10a37f]/10 border-[#10a37f] shadow-lg scale-[1.01] sm:scale-[1.02]'
+                                : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/10 active:bg-slate-100 dark:active:bg-white/10'
+                                }`}
                             >
                               {segment.speaker && (
                                 <p className="text-[10px] sm:text-xs font-bold text-[#10a37f] mb-1.5 sm:mb-2">{segment.speaker}</p>
@@ -3068,24 +2632,22 @@ function AppContent() {
                               {segment.timestamp && (
                                 <p className="text-[10px] sm:text-xs text-slate-500 mb-1.5 sm:mb-2">{segment.timestamp}</p>
                               )}
-                              <p className={`text-xs sm:text-sm leading-relaxed ${
-                                activeUtteranceIndex === idx
-                                  ? 'text-slate-900 dark:text-white font-medium'
-                                  : 'text-slate-700 dark:text-slate-300'
-                              }`}>{segment.text || segment.content || JSON.stringify(segment)}</p>
+                              <p className={`text-xs sm:text-sm leading-relaxed ${activeUtteranceIndex === idx
+                                ? 'text-slate-900 dark:text-white font-medium'
+                                : 'text-slate-700 dark:text-slate-300'
+                                }`}>{segment.text || segment.content || JSON.stringify(segment)}</p>
                             </div>
                           ))
                         ) : typeof selectedMemoryTranscript === 'object' && selectedMemoryTranscript.utterances ? (
                           selectedMemoryTranscript.utterances.map((utterance, idx) => (
-                            <div 
-                              key={idx} 
+                            <div
+                              key={idx}
                               ref={activeUtteranceIndex === idx ? activeUtteranceRef : null}
                               onClick={() => utterance.start && seekToTime(utterance.start)}
-                              className={`p-3 sm:p-4 rounded-lg sm:rounded-xl border transition-all duration-200 cursor-pointer ${
-                                activeUtteranceIndex === idx
-                                  ? 'bg-[#10a37f]/10 border-[#10a37f] shadow-lg scale-[1.01] sm:scale-[1.02]'
-                                  : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/10 active:bg-slate-100 dark:active:bg-white/10'
-                              }`}
+                              className={`p-3 sm:p-4 rounded-lg sm:rounded-xl border transition-all duration-200 cursor-pointer ${activeUtteranceIndex === idx
+                                ? 'bg-[#10a37f]/10 border-[#10a37f] shadow-lg scale-[1.01] sm:scale-[1.02]'
+                                : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/10 active:bg-slate-100 dark:active:bg-white/10'
+                                }`}
                             >
                               {utterance.speaker && (
                                 <p className="text-[10px] sm:text-xs font-bold text-[#10a37f] mb-1.5 sm:mb-2">Speaker {utterance.speaker}</p>
@@ -3093,16 +2655,15 @@ function AppContent() {
                               {utterance.start && (
                                 <p className="text-[10px] sm:text-xs text-slate-500 dark:text-slate-400 mb-1.5 sm:mb-2 flex items-center gap-1">
                                   <svg className="w-2.5 h-2.5 sm:w-3 sm:h-3" fill="currentColor" viewBox="0 0 24 24">
-                                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" />
                                   </svg>
                                   {formatTime(utterance.start / 1000)}
                                 </p>
                               )}
-                              <p className={`text-xs sm:text-sm leading-relaxed ${
-                                activeUtteranceIndex === idx
-                                  ? 'text-slate-900 dark:text-white font-medium'
-                                  : 'text-slate-700 dark:text-slate-300'
-                              }`}>{utterance.text}</p>
+                              <p className={`text-xs sm:text-sm leading-relaxed ${activeUtteranceIndex === idx
+                                ? 'text-slate-900 dark:text-white font-medium'
+                                : 'text-slate-700 dark:text-slate-300'
+                                }`}>{utterance.text}</p>
                             </div>
                           ))
                         ) : (
@@ -3136,7 +2697,7 @@ function AppContent() {
                             {audioUrl ? 'Ready to play' : 'Audio loading...'}
                           </p>
                         </div>
-                        
+
                         {audioUrl ? (
                           <>
                             {/* Audio Player with Waveform */}
@@ -3156,13 +2717,13 @@ function AppContent() {
                                 </div>
                                 <button onClick={togglePlayback} className="p-2 sm:p-2.5 text-white bg-[#10a37f] active:bg-[#1a7f64] rounded-lg transition-all active:scale-95 shadow-md shadow-[#10a37f]/20 flex-shrink-0 ml-2">
                                   {isPlaying ? (
-                                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg>
+                                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
                                   ) : (
-                                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
                                   )}
                                 </button>
                               </div>
-                              
+
                               {/* Progress Slider */}
                               <div className="mb-3 space-y-1.5 sm:space-y-2">
                                 <div className="relative">
@@ -3184,7 +2745,7 @@ function AppContent() {
                                   </span>
                                 </div>
                               </div>
-                              
+
                               {/* Waveform Visualization */}
                               <div className="flex items-end justify-center gap-0.5 h-8 sm:h-10 mt-2 sm:mt-3">
                                 {waveformData.map((value, index) => (
@@ -3200,12 +2761,12 @@ function AppContent() {
                                 ))}
                               </div>
                             </div>
-                            
+
                             {/* Hidden audio element */}
                             {audioUrl && (
-                              <audio 
-                                ref={audioPlayerRef} 
-                                src={audioUrl} 
+                              <audio
+                                ref={audioPlayerRef}
+                                src={audioUrl}
                                 onEnded={() => {
                                   setIsPlaying(false)
                                   setActiveUtteranceIndex(null)
@@ -3247,7 +2808,7 @@ function AppContent() {
                             <p className="text-sm text-slate-600 dark:text-slate-400">Loading audio...</p>
                           </div>
                         )}
-                        
+
                         {/* Memory Metadata */}
                         <div className="mt-4 sm:mt-6 pt-4 sm:pt-6 border-t border-slate-200 dark:border-white/10 space-y-2.5 sm:space-y-3">
                           {selectedMemory.topic && (
@@ -3372,7 +2933,7 @@ function AppContent() {
                       </div>
                     </div>
                   )}
-                  
+
                   {/* Progress Bar */}
                   <div className="mb-2">
                     <input
@@ -3387,7 +2948,7 @@ function AppContent() {
                       }}
                     />
                   </div>
-                  
+
                   {/* Player Controls */}
                   <div className="flex items-center gap-3">
                     {/* Thumbnail/Icon */}
@@ -3396,7 +2957,7 @@ function AppContent() {
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
                       </svg>
                     </div>
-                    
+
                     {/* Title and Info */}
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-semibold text-slate-800 dark:text-white truncate">
@@ -3406,19 +2967,19 @@ function AppContent() {
                         {formatTime(currentPlaybackTime)} / {formatTime(audioDuration || 0)}
                       </p>
                     </div>
-                    
+
                     {/* Play/Pause Button */}
-                    <button 
-                      onClick={togglePlayback} 
+                    <button
+                      onClick={togglePlayback}
                       className="w-10 h-10 bg-[#10a37f] text-white rounded-full flex items-center justify-center flex-shrink-0 shadow-lg active:scale-95 transition-transform hover:bg-[#1a7f64]"
                     >
                       {isPlaying ? (
                         <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
-                          <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/>
+                          <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
                         </svg>
                       ) : (
                         <svg className="w-5 h-5 ml-0.5" fill="currentColor" viewBox="0 0 24 24">
-                          <path d="M8 5v14l11-7z"/>
+                          <path d="M8 5v14l11-7z" />
                         </svg>
                       )}
                     </button>
@@ -3436,23 +2997,16 @@ function AppContent() {
   if (currentScreen === SCREENS.VIEW_RECORDING && selectedRecording) {
     return (
       <>
-        <ToastContainer />
-        <DateDetailsModal />
-        <LoginModal />
-        <SearchModal />
-        <ConfirmationModal />
-        <ProfileDialog />
-        <ConfirmationModal />
-        <ProfileDialog />
+        {globalModalsJSX}
         <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
           <div className="flex-1 flex flex-col min-w-0 h-[100dvh] overflow-hidden">
             <header className="h-14 lg:h-16 border-b border-slate-200 dark:border-white/10 px-4 lg:px-6 flex items-center justify-between bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl">
               <div className="flex items-center gap-3">
-                <button onClick={() => { 
-                  setCurrentScreen(SCREENS.MAIN); 
-                  setSelectedRecording(null); 
-                  setIsPlaying(false); 
+                <button onClick={() => {
+                  setCurrentScreen(SCREENS.MAIN);
+                  setSelectedRecording(null);
+                  setIsPlaying(false);
                   setActiveUtteranceIndex(null);
                   setCurrentPlaybackTime(0);
                 }} className="p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors text-slate-500">
@@ -3492,108 +3046,104 @@ function AppContent() {
                       </h2>
                       <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Full transcript of the recording</p>
                     </div>
-                  
-                  <div className="p-6 space-y-4 max-h-[500px] overflow-y-auto custom-scrollbar">
-                    {loadingRecording && !recordingTranscription ? (
-                      <div className="text-center py-12">
-                        <div className="relative w-16 h-16 mx-auto mb-6">
-                          <div className="absolute inset-0 border-4 border-[#10a37f]/20 rounded-full"></div>
-                          <div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-full animate-spin"></div>
+
+                    <div className="p-6 space-y-4 max-h-[500px] overflow-y-auto custom-scrollbar">
+                      {loadingRecording && !recordingTranscription ? (
+                        <div className="text-center py-12">
+                          <div className="relative w-16 h-16 mx-auto mb-6">
+                            <div className="absolute inset-0 border-4 border-[#10a37f]/20 rounded-full"></div>
+                            <div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-full animate-spin"></div>
+                          </div>
+                          <p className="text-slate-500 dark:text-slate-400 font-medium mb-2">Loading transcription...</p>
+                          <p className="text-xs text-slate-400 dark:text-slate-500">This may take a moment</p>
                         </div>
-                        <p className="text-slate-500 dark:text-slate-400 font-medium mb-2">Loading transcription...</p>
-                        <p className="text-xs text-slate-400 dark:text-slate-500">This may take a moment</p>
-                      </div>
-                    ) : recordingTranscription ? (
-                      typeof recordingTranscription === 'string' ? (
-                        <p className="text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap">{recordingTranscription}</p>
-                      ) : Array.isArray(recordingTranscription) ? (
-                        recordingTranscription.map((segment, idx) => (
-                          <div 
-                            key={idx} 
-                            ref={activeUtteranceIndex === idx ? activeUtteranceRef : null}
-                            onClick={() => segment.start && seekToTime(segment.start)}
-                            className={`p-4 rounded-xl border transition-all cursor-pointer ${
-                              activeUtteranceIndex === idx
+                      ) : recordingTranscription ? (
+                        typeof recordingTranscription === 'string' ? (
+                          <p className="text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap">{recordingTranscription}</p>
+                        ) : Array.isArray(recordingTranscription) ? (
+                          recordingTranscription.map((segment, idx) => (
+                            <div
+                              key={idx}
+                              ref={activeUtteranceIndex === idx ? activeUtteranceRef : null}
+                              onClick={() => segment.start && seekToTime(segment.start)}
+                              className={`p-4 rounded-xl border transition-all cursor-pointer ${activeUtteranceIndex === idx
                                 ? 'bg-[#10a37f]/10 border-[#10a37f] shadow-lg scale-[1.02]'
                                 : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/10'
-                            }`}
-                          >
-                            {segment.speaker && (
-                              <p className="text-xs font-bold text-[#10a37f] mb-2">{segment.speaker}</p>
-                            )}
-                            {segment.timestamp && (
-                              <p className="text-xs text-slate-500 mb-2">{segment.timestamp}</p>
-                            )}
-                            <p className={`text-sm leading-relaxed ${
-                              activeUtteranceIndex === idx
+                                }`}
+                            >
+                              {segment.speaker && (
+                                <p className="text-xs font-bold text-[#10a37f] mb-2">{segment.speaker}</p>
+                              )}
+                              {segment.timestamp && (
+                                <p className="text-xs text-slate-500 mb-2">{segment.timestamp}</p>
+                              )}
+                              <p className={`text-sm leading-relaxed ${activeUtteranceIndex === idx
                                 ? 'text-slate-900 dark:text-white font-medium'
                                 : 'text-slate-700 dark:text-slate-300'
-                            }`}>{segment.text || segment.content || JSON.stringify(segment)}</p>
-                          </div>
-                        ))
-                      ) : typeof recordingTranscription === 'object' ? (
-                        <div className="space-y-4">
-                          {/* Check for common transcription text fields */}
-                          {(recordingTranscription.text || recordingTranscription.content) ? (
-                            <p className="text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap">
-                              {recordingTranscription.text || recordingTranscription.content}
-                            </p>
-                          ) : recordingTranscription.utterances && Array.isArray(recordingTranscription.utterances) ? (
-                            recordingTranscription.utterances.map((utterance, idx) => (
-                              <div 
-                                key={idx} 
-                                ref={activeUtteranceIndex === idx ? activeUtteranceRef : null}
-                                onClick={() => utterance.start && seekToTime(utterance.start)}
-                                className={`p-4 rounded-xl border transition-all duration-200 cursor-pointer ${
-                                  activeUtteranceIndex === idx
+                                }`}>{segment.text || segment.content || JSON.stringify(segment)}</p>
+                            </div>
+                          ))
+                        ) : typeof recordingTranscription === 'object' ? (
+                          <div className="space-y-4">
+                            {/* Check for common transcription text fields */}
+                            {(recordingTranscription.text || recordingTranscription.content) ? (
+                              <p className="text-slate-700 dark:text-slate-300 leading-relaxed whitespace-pre-wrap">
+                                {recordingTranscription.text || recordingTranscription.content}
+                              </p>
+                            ) : recordingTranscription.utterances && Array.isArray(recordingTranscription.utterances) ? (
+                              recordingTranscription.utterances.map((utterance, idx) => (
+                                <div
+                                  key={idx}
+                                  ref={activeUtteranceIndex === idx ? activeUtteranceRef : null}
+                                  onClick={() => utterance.start && seekToTime(utterance.start)}
+                                  className={`p-4 rounded-xl border transition-all duration-200 cursor-pointer ${activeUtteranceIndex === idx
                                     ? 'bg-[#10a37f]/10 border-[#10a37f] shadow-lg scale-[1.02]'
                                     : 'bg-slate-50 dark:bg-white/5 border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/10'
-                                }`}
-                              >
-                                {utterance.speaker && (
-                                  <p className="text-xs font-bold text-[#10a37f] mb-2">Speaker {utterance.speaker}</p>
-                                )}
-                                {utterance.start && (
-                                  <p className="text-xs text-slate-500 dark:text-slate-400 mb-2 flex items-center gap-1">
-                                    <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
-                                      <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
-                                    </svg>
-                                    {Math.floor(utterance.start / 1000)}s
-                                  </p>
-                                )}
-                                <p className={`text-sm leading-relaxed ${
-                                  activeUtteranceIndex === idx
+                                    }`}
+                                >
+                                  {utterance.speaker && (
+                                    <p className="text-xs font-bold text-[#10a37f] mb-2">Speaker {utterance.speaker}</p>
+                                  )}
+                                  {utterance.start && (
+                                    <p className="text-xs text-slate-500 dark:text-slate-400 mb-2 flex items-center gap-1">
+                                      <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z" />
+                                      </svg>
+                                      {Math.floor(utterance.start / 1000)}s
+                                    </p>
+                                  )}
+                                  <p className={`text-sm leading-relaxed ${activeUtteranceIndex === idx
                                     ? 'text-slate-900 dark:text-white font-medium'
                                     : 'text-slate-700 dark:text-slate-300'
-                                }`}>{utterance.text}</p>
+                                    }`}>{utterance.text}</p>
+                                </div>
+                              ))
+                            ) : recordingTranscription.words && Array.isArray(recordingTranscription.words) ? (
+                              <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10">
+                                <p className="text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
+                                  {recordingTranscription.words.map(w => w.text || w.word).join(' ')}
+                                </p>
                               </div>
-                            ))
-                          ) : recordingTranscription.words && Array.isArray(recordingTranscription.words) ? (
-                            <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10">
-                              <p className="text-sm text-slate-700 dark:text-slate-300 leading-relaxed">
-                                {recordingTranscription.words.map(w => w.text || w.word).join(' ')}
-                              </p>
-                            </div>
-                          ) : (
-                            <div className="p-4 bg-yellow-50 dark:bg-yellow-900/20 rounded-xl border border-yellow-200 dark:border-yellow-800">
-                              <p className="text-xs font-bold text-yellow-700 dark:text-yellow-300 mb-2">Raw Transcription Object:</p>
-                              <pre className="text-xs text-yellow-600 dark:text-yellow-400 whitespace-pre-wrap overflow-x-auto">{JSON.stringify(recordingTranscription, null, 2)}</pre>
-                            </div>
-                          )}
-                        </div>
+                            ) : (
+                              <div className="p-4 bg-yellow-50 dark:bg-yellow-900/20 rounded-xl border border-yellow-200 dark:border-yellow-800">
+                                <p className="text-xs font-bold text-yellow-700 dark:text-yellow-300 mb-2">Raw Transcription Object:</p>
+                                <pre className="text-xs text-yellow-600 dark:text-yellow-400 whitespace-pre-wrap overflow-x-auto">{JSON.stringify(recordingTranscription, null, 2)}</pre>
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10">
+                            <pre className="text-xs text-slate-700 dark:text-slate-300 whitespace-pre-wrap overflow-x-auto">{JSON.stringify(recordingTranscription, null, 2)}</pre>
+                          </div>
+                        )
                       ) : (
-                        <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-xl border border-slate-200 dark:border-white/10">
-                          <pre className="text-xs text-slate-700 dark:text-slate-300 whitespace-pre-wrap overflow-x-auto">{JSON.stringify(recordingTranscription, null, 2)}</pre>
+                        <div className="text-center py-12">
+                          <svg className="w-12 h-12 text-slate-300 dark:text-slate-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                          </svg>
+                          <p className="text-slate-500 dark:text-slate-400">No transcription available</p>
                         </div>
-                      )
-                    ) : (
-                      <div className="text-center py-12">
-                        <svg className="w-12 h-12 text-slate-300 dark:text-slate-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                        </svg>
-                        <p className="text-slate-500 dark:text-slate-400">No transcription available</p>
-                      </div>
-                    )}
+                      )}
                     </div>
                   </div>
 
@@ -3609,7 +3159,7 @@ function AppContent() {
                           {loadingRecording && !selectedRecording?.audioUrl ? 'Loading audio...' : selectedRecording?.audioUrl ? 'Ready to play' : 'No audio available'}
                         </p>
                       </div>
-                      
+
                       {loadingRecording && !selectedRecording?.audioUrl ? (
                         <div className="text-center py-8">
                           <div className="relative w-12 h-12 mx-auto mb-4">
@@ -3623,15 +3173,15 @@ function AppContent() {
                           <div className="mb-4 flex justify-center">
                             <button onClick={toggleRecordingPlayback} className="p-6 bg-[#10a37f] hover:bg-[#1a7f64] text-white rounded-2xl transition-all active:scale-95 shadow-xl">
                               {isPlaying ? (
-                                <svg className="w-8 h-8" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg>
+                                <svg className="w-8 h-8" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
                               ) : (
-                                <svg className="w-8 h-8" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                                <svg className="w-8 h-8" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
                               )}
                             </button>
                           </div>
-                          <audio 
-                            ref={recordingAudioRef} 
-                            src={selectedRecording.audioUrl} 
+                          <audio
+                            ref={recordingAudioRef}
+                            src={selectedRecording.audioUrl}
                             onEnded={() => {
                               setIsPlaying(false)
                               setActiveUtteranceIndex(null)
@@ -3646,7 +3196,7 @@ function AppContent() {
                             <div className="flex items-center justify-between text-xs text-slate-600 dark:text-slate-400">
                               <span>Audio File</span>
                               <svg className="w-4 h-4 text-[#10a37f]" fill="currentColor" viewBox="0 0 24 24">
-                                <path d="M9 11l3-3m0 0l3 3m-3-3v8m0-13a9 9 0 110 18 9 9 0 010-18z"/>
+                                <path d="M9 11l3-3m0 0l3 3m-3-3v8m0-13a9 9 0 110 18 9 9 0 010-18z" />
                               </svg>
                             </div>
                           </div>
@@ -3673,14 +3223,7 @@ function AppContent() {
   if (currentScreen === SCREENS.REVIEW) {
     return (
       <>
-        <ToastContainer />
-        <DateDetailsModal />
-        <LoginModal />
-        <SearchModal />
-        <ConfirmationModal />
-        <ProfileDialog />
-        <ConfirmationModal />
-        <ProfileDialog />
+        {globalModalsJSX}
         {showTagModal && (
           <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
             <div className="bg-white dark:bg-[#171717] rounded-2xl p-6 max-w-md w-full shadow-2xl border border-slate-200 dark:border-white/10">
@@ -3688,8 +3231,8 @@ function AppContent() {
               <div className="space-y-4">
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">Tag Name</label>
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     value={newTagName}
                     onChange={(e) => setNewTagName(e.target.value)}
                     placeholder="e.g., Work, Personal, Ideas"
@@ -3699,21 +3242,21 @@ function AppContent() {
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">Color</label>
-                  <input 
-                    type="color" 
+                  <input
+                    type="color"
                     value={newTagColor}
                     onChange={(e) => setNewTagColor(e.target.value)}
                     className="w-full h-12 rounded-xl cursor-pointer"
                   />
                 </div>
                 <div className="flex gap-3 pt-2">
-                  <button 
+                  <button
                     onClick={createTag}
                     className="flex-1 py-3 bg-[#10a37f] text-white font-semibold rounded-xl hover:bg-[#1a7f64] transition-colors"
                   >
                     Create Tag
                   </button>
-                  <button 
+                  <button
                     onClick={() => setShowTagModal(false)}
                     className="flex-1 py-3 bg-slate-100 dark:bg-white/5 text-slate-700 dark:text-white font-semibold rounded-xl hover:bg-slate-200 dark:hover:bg-white/10 transition-colors"
                   >
@@ -3741,7 +3284,7 @@ function AppContent() {
             </div>
           </div>
         )}
-        
+
         {showTagManagementModal && (
           <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
             <div className="bg-white dark:bg-[#171717] rounded-2xl p-6 max-w-lg w-full shadow-2xl border border-slate-200 dark:border-white/10 max-h-[80vh] overflow-y-auto">
@@ -3756,7 +3299,7 @@ function AppContent() {
                   </svg>
                 </button>
               </div>
-              
+
               {tags.length === 0 ? (
                 <div className="text-center py-8">
                   <p className="text-slate-500 dark:text-slate-400 mb-4">No tags yet</p>
@@ -3807,7 +3350,7 @@ function AppContent() {
                   ))}
                 </div>
               )}
-              
+
               <div className="mt-6 pt-4 border-t border-slate-200 dark:border-white/10">
                 <button
                   onClick={() => {
@@ -3825,7 +3368,7 @@ function AppContent() {
             </div>
           </div>
         )}
-        
+
         {showMemoryDetailModal && selectedMemory && (
           <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
             <div className="bg-white dark:bg-[#171717] rounded-2xl p-6 max-w-2xl w-full shadow-2xl border border-slate-200 dark:border-white/10 max-h-[85vh] overflow-y-auto">
@@ -3848,11 +3391,11 @@ function AppContent() {
                 <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border border-slate-200 dark:border-white/10">
                   <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2 px-1">Title</label>
                   {editingMemory ? (
-                    <input 
-                      type="text" 
-                      value={memoryTitle} 
-                      onChange={(e) => setMemoryTitle(e.target.value)} 
-                      className="w-full bg-transparent text-lg font-bold focus:outline-none dark:text-white px-1" 
+                    <input
+                      type="text"
+                      value={memoryTitle}
+                      onChange={(e) => setMemoryTitle(e.target.value)}
+                      className="w-full bg-transparent text-lg font-bold focus:outline-none dark:text-white px-1"
                     />
                   ) : (
                     <p className="text-lg font-bold dark:text-white px-1">{selectedMemory.title || 'Untitled'}</p>
@@ -3863,10 +3406,10 @@ function AppContent() {
                 <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border border-slate-200 dark:border-white/10">
                   <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2 px-1">Description</label>
                   {editingMemory ? (
-                    <textarea 
-                      value={memoryText} 
-                      onChange={(e) => setMemoryText(e.target.value)} 
-                      className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1 min-h-[100px] resize-none" 
+                    <textarea
+                      value={memoryText}
+                      onChange={(e) => setMemoryText(e.target.value)}
+                      className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1 min-h-[100px] resize-none"
                     />
                   ) : (
                     <p className="text-sm dark:text-white px-1">{selectedMemory.description || 'No description'}</p>
@@ -3899,11 +3442,11 @@ function AppContent() {
                   <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border border-slate-200 dark:border-white/10">
                     <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2 px-1">Topic</label>
                     {editingMemory ? (
-                      <input 
-                        type="text" 
-                        value={memoryTopic} 
-                        onChange={(e) => setMemoryTopic(e.target.value)} 
-                        className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1" 
+                      <input
+                        type="text"
+                        value={memoryTopic}
+                        onChange={(e) => setMemoryTopic(e.target.value)}
+                        className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1"
                       />
                     ) : (
                       <p className="text-sm dark:text-white px-1">{selectedMemory.topic || 'None'}</p>
@@ -3913,11 +3456,11 @@ function AppContent() {
                   <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border border-slate-200 dark:border-white/10">
                     <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2 px-1">Date</label>
                     {editingMemory ? (
-                      <input 
-                        type="datetime-local" 
-                        value={memoryDate} 
-                        onChange={(e) => setMemoryDate(e.target.value)} 
-                        className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1" 
+                      <input
+                        type="datetime-local"
+                        value={memoryDate}
+                        onChange={(e) => setMemoryDate(e.target.value)}
+                        className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1"
                       />
                     ) : (
                       <p className="text-sm dark:text-white px-1">
@@ -3937,11 +3480,10 @@ function AppContent() {
                             key={mood}
                             type="button"
                             onClick={() => setMemoryMood(memoryMood === mood ? null : mood)}
-                            className={`flex-1 py-2 rounded-lg text-lg transition-all ${
-                              memoryMood === mood 
-                                ? 'bg-[#10a37f] shadow-md scale-110' 
-                                : 'bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10'
-                            }`}
+                            className={`flex-1 py-2 rounded-lg text-lg transition-all ${memoryMood === mood
+                              ? 'bg-[#10a37f] shadow-md scale-110'
+                              : 'bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10'
+                              }`}
                           >
                             {['😢', '😕', '😐', '🙂', '😄'][mood - 1]}
                           </button>
@@ -3957,11 +3499,11 @@ function AppContent() {
                   <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border border-slate-200 dark:border-white/10">
                     <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2 px-1">People</label>
                     {editingMemory ? (
-                      <input 
-                        type="text" 
-                        value={memoryPeople} 
-                        onChange={(e) => setMemoryPeople(e.target.value)} 
-                        className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1" 
+                      <input
+                        type="text"
+                        value={memoryPeople}
+                        onChange={(e) => setMemoryPeople(e.target.value)}
+                        className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1"
                         placeholder="John, Sarah, ..."
                       />
                     ) : (
@@ -3981,11 +3523,10 @@ function AppContent() {
                         <button
                           key={tag.id}
                           onClick={() => toggleTag(tag)}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                            selectedTags.find(t => t.id === tag.id)
-                              ? 'ring-2 ring-offset-2 dark:ring-offset-[#171717]'
-                              : 'opacity-60 hover:opacity-100'
-                          }`}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedTags.find(t => t.id === tag.id)
+                            ? 'ring-2 ring-offset-2 dark:ring-offset-[#171717]'
+                            : 'opacity-60 hover:opacity-100'
+                            }`}
                           style={{
                             backgroundColor: tag.color + '20',
                             color: tag.color,
@@ -4000,7 +3541,7 @@ function AppContent() {
                     <div className="flex flex-wrap gap-2 px-1">
                       {selectedMemory.tags && selectedMemory.tags.length > 0 ? (
                         selectedMemory.tags.map(tag => (
-                          <span 
+                          <span
                             key={tag.id}
                             className="px-3 py-1.5 rounded-lg text-xs font-semibold"
                             style={{ backgroundColor: tag.color + '20', color: tag.color }}
@@ -4045,7 +3586,7 @@ function AppContent() {
                         </span>
                       )}
                     </div>
-                    
+
                     {loadingTranscript ? (
                       <div className="flex items-center justify-center py-8">
                         <div className="flex items-center gap-2 text-slate-500">
@@ -4142,12 +3683,12 @@ function AppContent() {
             </div>
           </div>
         )}
-        
+
         <div className="h-[100dvh] bg-white dark:bg-[#0d0d0d] relative overflow-hidden md:flex md:items-center md:justify-center">
           {audioUrl && (
-            <audio 
-              ref={audioPlayerRef} 
-              src={audioUrl} 
+            <audio
+              ref={audioPlayerRef}
+              src={audioUrl}
               onEnded={() => setIsPlaying(false)}
               onTimeUpdate={handleTimeUpdate}
               onLoadedMetadata={handleLoadedMetadata}
@@ -4173,7 +3714,7 @@ function AppContent() {
                   </svg>
                 </button>
               </div>
-              
+
               <div className="grid grid-cols-2 gap-6 flex-1 min-h-0">
                 {/* Left Column: Required Fields */}
                 <div className="flex flex-col space-y-6">
@@ -4182,89 +3723,89 @@ function AppContent() {
                     <label className="block text-xs font-bold text-[#10a37f] uppercase tracking-wider mb-3 px-1">
                       Memory Title ✱
                     </label>
-                    <input 
-                      type="text" 
-                      value={hasEditedTitle ? (memoryTitle || '') : (memoryTitle ?? recordingName ?? '')} 
+                    <input
+                      type="text"
+                      value={hasEditedTitle ? (memoryTitle || '') : (memoryTitle ?? recordingName ?? '')}
                       onChange={(e) => {
                         setMemoryTitle(e.target.value)
                         setHasEditedTitle(true)
-                      }} 
-                      className="w-full bg-transparent text-2xl font-bold focus:outline-none focus:ring-0 dark:text-white px-1 placeholder:text-slate-300 dark:placeholder:text-slate-600" 
-                      placeholder="Give it a meaningful title..." 
+                      }}
+                      className="w-full bg-transparent text-2xl font-bold focus:outline-none focus:ring-0 dark:text-white px-1 placeholder:text-slate-300 dark:placeholder:text-slate-600"
+                      placeholder="Give it a meaningful title..."
                       autoFocus
                     />
                   </div>
-                  
-                {/* Audio Clip - Required visual */}
-                <div className="px-6 py-4 bg-white dark:bg-white/10 rounded-2xl border-2 border-[#10a37f]/20 dark:border-[#10a37f]/30 shadow-sm">
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="flex items-center gap-4">
-                      <div className="w-12 h-12 bg-[#10a37f]/10 text-[#10a37f] rounded-xl flex items-center justify-center shadow-inner">
-                        <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                        </svg>
+
+                  {/* Audio Clip - Required visual */}
+                  <div className="px-6 py-4 bg-white dark:bg-white/10 rounded-2xl border-2 border-[#10a37f]/20 dark:border-[#10a37f]/30 shadow-sm">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-4">
+                        <div className="w-12 h-12 bg-[#10a37f]/10 text-[#10a37f] rounded-xl flex items-center justify-center shadow-inner">
+                          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                        </div>
+                        <div>
+                          <p className="text-sm font-bold dark:text-white">Audio Clip</p>
+                          <p className="text-xs text-slate-500 font-semibold">{formatTime(savedRecordingDuration)} duration</p>
+                        </div>
                       </div>
-                      <div>
-                        <p className="text-sm font-bold dark:text-white">Audio Clip</p>
-                        <p className="text-xs text-slate-500 font-semibold">{formatTime(savedRecordingDuration)} duration</p>
+                      <button onClick={togglePlayback} className="p-3 text-white bg-[#10a37f] hover:bg-[#1a7f64] rounded-xl transition-all active:scale-95 shadow-lg shadow-[#10a37f]/20">
+                        {isPlaying ? (
+                          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
+                        ) : (
+                          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
+                        )}
+                      </button>
+                    </div>
+                    {/* Progress Slider */}
+                    <div className="mt-4 space-y-2">
+                      <div className="relative">
+                        <input
+                          type="range"
+                          min="0"
+                          max={getValidDuration()}
+                          value={currentPlaybackTime || 0}
+                          onChange={handleSeek}
+                          className="w-full h-2 bg-slate-200 dark:bg-white/10 rounded-full appearance-none cursor-pointer custom-range-slider"
+                          style={{
+                            background: `linear-gradient(to right, #10a37f 0%, #10a37f ${((currentPlaybackTime || 0) / getValidDuration()) * 100}%, rgb(226 232 240) ${((currentPlaybackTime || 0) / getValidDuration()) * 100}%, rgb(226 232 240) 100%)`
+                          }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
+                          {formatTime(currentPlaybackTime)}
+                        </span>
+                        <span className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
+                          {formatTime(getValidDuration())}
+                        </span>
                       </div>
                     </div>
-                    <button onClick={togglePlayback} className="p-3 text-white bg-[#10a37f] hover:bg-[#1a7f64] rounded-xl transition-all active:scale-95 shadow-lg shadow-[#10a37f]/20">
-                      {isPlaying ? (
-                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg>
-                      ) : (
-                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-                      )}
-                    </button>
-                  </div>
-                  {/* Progress Slider */}
-                  <div className="mt-4 space-y-2">
-                    <div className="relative">
-                      <input
-                        type="range"
-                        min="0"
-                        max={getValidDuration()}
-                        value={currentPlaybackTime || 0}
-                        onChange={handleSeek}
-                                    className="w-full h-2 bg-slate-200 dark:bg-white/10 rounded-full appearance-none cursor-pointer custom-range-slider"
-                        style={{
-                          background: `linear-gradient(to right, #10a37f 0%, #10a37f ${((currentPlaybackTime || 0) / getValidDuration()) * 100}%, rgb(226 232 240) ${((currentPlaybackTime || 0) / getValidDuration()) * 100}%, rgb(226 232 240) 100%)`
-                        }}
-                      />
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
-                        {formatTime(currentPlaybackTime)}
-                      </span>
-                      <span className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
-                        {formatTime(getValidDuration())}
-                      </span>
+                    {/* Waveform Visualization */}
+                    <div className="flex items-end justify-center gap-1 h-12 mt-2">
+                      {waveformData.map((value, index) => (
+                        <div
+                          key={index}
+                          className="flex-1 bg-[#10a37f] rounded-t transition-all duration-75 ease-out"
+                          style={{
+                            height: isPlaying ? `${Math.max(4, value * 100)}%` : '4px',
+                            opacity: isPlaying ? 0.6 + (value * 0.4) : 0.2,
+                            minHeight: '4px'
+                          }}
+                        />
+                      ))}
                     </div>
                   </div>
-                  {/* Waveform Visualization */}
-                  <div className="flex items-end justify-center gap-1 h-12 mt-2">
-                    {waveformData.map((value, index) => (
-                      <div
-                        key={index}
-                        className="flex-1 bg-[#10a37f] rounded-t transition-all duration-75 ease-out"
-                        style={{
-                          height: isPlaying ? `${Math.max(4, value * 100)}%` : '4px',
-                          opacity: isPlaying ? 0.6 + (value * 0.4) : 0.2,
-                          minHeight: '4px'
-                        }}
-                      />
-                    ))}
-                  </div>
-                </div>
 
                   {/* Additional Notes */}
                   <div className="flex-1 p-5 bg-slate-50/50 dark:bg-white/5 rounded-2xl border border-slate-200/50 dark:border-white/5">
                     <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3 px-1">Additional Notes</label>
-                    <textarea 
-                      value={memoryText} 
-                      onChange={(e) => setMemoryText(e.target.value)} 
-                      className="w-full h-full bg-transparent text-sm focus:outline-none dark:text-white px-1 resize-none placeholder:text-slate-400 dark:placeholder:text-slate-600" 
+                    <textarea
+                      value={memoryText}
+                      onChange={(e) => setMemoryText(e.target.value)}
+                      className="w-full h-full bg-transparent text-sm focus:outline-none dark:text-white px-1 resize-none placeholder:text-slate-400 dark:placeholder:text-slate-600"
                       placeholder="Add context, thoughts, or key points..."
                     />
                   </div>
@@ -4274,11 +3815,11 @@ function AppContent() {
                 <div className="flex flex-col space-y-5 overflow-y-auto">
                   <div className="p-5 bg-slate-50/50 dark:bg-white/5 rounded-2xl border border-slate-200/50 dark:border-white/5">
                     <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3 px-1">Topic</label>
-                    <input 
-                      type="text" 
-                      value={memoryTopic} 
-                      onChange={(e) => setMemoryTopic(e.target.value)} 
-                      className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1 placeholder:text-slate-400 dark:placeholder:text-slate-600" 
+                    <input
+                      type="text"
+                      value={memoryTopic}
+                      onChange={(e) => setMemoryTopic(e.target.value)}
+                      className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1 placeholder:text-slate-400 dark:placeholder:text-slate-600"
                       placeholder="e.g., Work Meeting, Personal Reflection"
                     />
                   </div>
@@ -4292,11 +3833,10 @@ function AppContent() {
                             key={mood}
                             type="button"
                             onClick={() => setMemoryMood(memoryMood === mood ? null : mood)}
-                            className={`flex-1 py-2.5 rounded-lg text-xl transition-all ${
-                              memoryMood === mood 
-                                ? 'bg-[#10a37f] shadow-lg scale-110 ring-2 ring-[#10a37f]/30 ring-offset-2' 
-                                : 'bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 hover:scale-105'
-                            }`}
+                            className={`flex-1 py-2.5 rounded-lg text-xl transition-all ${memoryMood === mood
+                              ? 'bg-[#10a37f] shadow-lg scale-110 ring-2 ring-[#10a37f]/30 ring-offset-2'
+                              : 'bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 hover:scale-105'
+                              }`}
                             title={['😢', '😕', '😐', '🙂', '😄'][mood - 1]}
                           >
                             {['😢', '😕', '😐', '🙂', '😄'][mood - 1]}
@@ -4307,11 +3847,11 @@ function AppContent() {
 
                     <div className="p-5 bg-slate-50/50 dark:bg-white/5 rounded-2xl border border-slate-200/50 dark:border-white/5">
                       <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-3 px-1">People</label>
-                      <input 
-                        type="text" 
-                        value={memoryPeople} 
-                        onChange={(e) => setMemoryPeople(e.target.value)} 
-                        className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1 placeholder:text-slate-400 dark:placeholder:text-slate-600" 
+                      <input
+                        type="text"
+                        value={memoryPeople}
+                        onChange={(e) => setMemoryPeople(e.target.value)}
+                        className="w-full bg-transparent text-sm focus:outline-none dark:text-white px-1 placeholder:text-slate-400 dark:placeholder:text-slate-600"
                         placeholder="John, Sarah, ..."
                       />
                     </div>
@@ -4322,14 +3862,14 @@ function AppContent() {
                       <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">
                         Tags {tags.length > 0 && <span className="text-slate-500">({tags.length} available)</span>}
                       </label>
-                      <button 
+                      <button
                         onClick={() => setShowTagModal(true)}
                         className="text-xs font-semibold text-[#10a37f] hover:text-[#1a7f64] transition-colors"
                       >
                         + New Tag
                       </button>
                     </div>
-                    
+
                     {tags.length === 0 ? (
                       <div className="text-center py-6 px-1">
                         <p className="text-sm text-slate-400 mb-2">No tags yet</p>
@@ -4346,16 +3886,15 @@ function AppContent() {
                           {tags.map(tag => {
                             const isSelected = selectedTags.find(t => t.id === tag.id)
                             const memoryCount = tag.memory_count || 0
-                            
+
                             return (
                               <div key={tag.id} className="relative group">
                                 <button
                                   onClick={() => toggleTag(tag)}
-                                  className={`relative px-3 py-2 rounded-lg text-xs font-semibold transition-all ${
-                                    isSelected
-                                      ? 'ring-2 ring-offset-2 dark:ring-offset-[#171717] scale-105'
-                                      : 'opacity-70 hover:opacity-100 hover:scale-105'
-                                  }`}
+                                  className={`relative px-3 py-2 rounded-lg text-xs font-semibold transition-all ${isSelected
+                                    ? 'ring-2 ring-offset-2 dark:ring-offset-[#171717] scale-105'
+                                    : 'opacity-70 hover:opacity-100 hover:scale-105'
+                                    }`}
                                   style={{
                                     backgroundColor: tag.color + '20',
                                     color: tag.color,
@@ -4371,9 +3910,9 @@ function AppContent() {
                                     )}
                                     <span>{tag.name}</span>
                                     {memoryCount > 0 && (
-                                      <span 
+                                      <span
                                         className="text-[9px] px-1.5 py-0.5 rounded-full font-bold"
-                                        style={{ 
+                                        style={{
                                           backgroundColor: tag.color + '40',
                                           color: tag.color
                                         }}
@@ -4413,8 +3952,8 @@ function AppContent() {
 
                   {/* Action Buttons */}
                   <div className="grid grid-cols-1 gap-4 pt-4 border-t border-slate-200 dark:border-white/10">
-                    <button 
-                      onClick={uploadAndProcess} 
+                    <button
+                      onClick={uploadAndProcess}
                       className="w-full py-5 bg-[#10a37f] text-white text-base font-bold rounded-2xl shadow-lg shadow-[#10a37f]/30 hover:bg-[#1a7f64] hover:shadow-xl hover:shadow-[#10a37f]/40 transition-all active:scale-[0.98] flex items-center justify-center gap-3"
                     >
                       <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -4422,7 +3961,7 @@ function AppContent() {
                       </svg>
                       Save Memory
                     </button>
-                    <button 
+                    <button
                       onClick={handleDiscardMemory}
                       className="w-full py-3 text-slate-500 dark:text-white/40 font-semibold text-sm hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-500/10 rounded-xl transition-colors"
                     >
@@ -4461,15 +4000,15 @@ function AppContent() {
                   <label className="block text-[10px] font-bold text-[#10a37f] uppercase tracking-wider mb-2">
                     Memory Title ✱
                   </label>
-                  <input 
-                    type="text" 
-                    value={hasEditedTitle ? (memoryTitle || '') : (memoryTitle ?? recordingName ?? '')} 
+                  <input
+                    type="text"
+                    value={hasEditedTitle ? (memoryTitle || '') : (memoryTitle ?? recordingName ?? '')}
                     onChange={(e) => {
                       setMemoryTitle(e.target.value)
                       setHasEditedTitle(true)
-                    }} 
-                    className="w-full bg-transparent text-lg font-bold focus:outline-none focus:ring-0 dark:text-white placeholder:text-slate-300 dark:placeholder:text-slate-600" 
-                    placeholder="Give it a meaningful title..." 
+                    }}
+                    className="w-full bg-transparent text-lg font-bold focus:outline-none focus:ring-0 dark:text-white placeholder:text-slate-300 dark:placeholder:text-slate-600"
+                    placeholder="Give it a meaningful title..."
                     autoFocus
                   />
                 </div>
@@ -4491,9 +4030,9 @@ function AppContent() {
                     </div>
                     <button onClick={togglePlayback} className="p-2.5 text-white bg-[#10a37f] active:bg-[#1a7f64] rounded-lg transition-all active:scale-95 shadow-md shadow-[#10a37f]/20 flex-shrink-0 ml-2">
                       {isPlaying ? (
-                        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/></svg>
+                        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" /></svg>
                       ) : (
-                        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
                       )}
                     </button>
                   </div>
@@ -4552,10 +4091,10 @@ function AppContent() {
                 {/* Additional Notes */}
                 <div className="p-4 bg-slate-50/50 dark:bg-white/5 rounded-xl border border-slate-200/50 dark:border-white/5">
                   <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Additional Notes</label>
-                  <textarea 
-                    value={memoryText} 
-                    onChange={(e) => setMemoryText(e.target.value)} 
-                    className="w-full bg-transparent text-sm focus:outline-none dark:text-white min-h-[100px] resize-none placeholder:text-slate-400 dark:placeholder:text-slate-600" 
+                  <textarea
+                    value={memoryText}
+                    onChange={(e) => setMemoryText(e.target.value)}
+                    className="w-full bg-transparent text-sm focus:outline-none dark:text-white min-h-[100px] resize-none placeholder:text-slate-400 dark:placeholder:text-slate-600"
                     placeholder="Add context, thoughts, or key points..."
                   />
                 </div>
@@ -4563,11 +4102,11 @@ function AppContent() {
                 {/* Topic */}
                 <div className="p-4 bg-slate-50/50 dark:bg-white/5 rounded-xl border border-slate-200/50 dark:border-white/5">
                   <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Topic</label>
-                  <input 
-                    type="text" 
-                    value={memoryTopic} 
-                    onChange={(e) => setMemoryTopic(e.target.value)} 
-                    className="w-full bg-transparent text-sm focus:outline-none dark:text-white placeholder:text-slate-400 dark:placeholder:text-slate-600" 
+                  <input
+                    type="text"
+                    value={memoryTopic}
+                    onChange={(e) => setMemoryTopic(e.target.value)}
+                    className="w-full bg-transparent text-sm focus:outline-none dark:text-white placeholder:text-slate-400 dark:placeholder:text-slate-600"
                     placeholder="e.g., Work Meeting, Personal Reflection"
                   />
                 </div>
@@ -4577,31 +4116,30 @@ function AppContent() {
                   <div className="p-4 bg-slate-50/50 dark:bg-white/5 rounded-xl border border-slate-200/50 dark:border-white/5">
                     <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">Mood</label>
                     <div className="flex gap-1.5">
-                        {[1, 2, 3, 4, 5].map((mood) => (
-                          <button
-                            key={mood}
-                            type="button"
-                            onClick={() => setMemoryMood(memoryMood === mood ? null : mood)}
-                            className={`flex-1 py-1 rounded-lg text-lg transition-all ${
-                              memoryMood === mood 
-                                ? 'bg-[#10a37f] shadow-md scale-105 ring-2 ring-[#10a37f]/30' 
-                                : 'bg-white dark:bg-white/5 active:bg-slate-100 dark:active:bg-white/10'
+                      {[1, 2, 3, 4, 5].map((mood) => (
+                        <button
+                          key={mood}
+                          type="button"
+                          onClick={() => setMemoryMood(memoryMood === mood ? null : mood)}
+                          className={`flex-1 py-1 rounded-lg text-lg transition-all ${memoryMood === mood
+                            ? 'bg-[#10a37f] shadow-md scale-105 ring-2 ring-[#10a37f]/30'
+                            : 'bg-white dark:bg-white/5 active:bg-slate-100 dark:active:bg-white/10'
                             }`}
-                            title={['😢', '😕', '😐', '🙂', '😄'][mood - 1]}
-                          >
-                            {['😢', '😕', '😐', '🙂', '😄'][mood - 1]}
-                          </button>
-                        ))}
+                          title={['😢', '😕', '😐', '🙂', '😄'][mood - 1]}
+                        >
+                          {['😢', '😕', '😐', '🙂', '😄'][mood - 1]}
+                        </button>
+                      ))}
                     </div>
                   </div>
 
                   <div className="p-4 bg-slate-50/50 dark:bg-white/5 rounded-xl border border-slate-200/50 dark:border-white/5">
                     <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">People</label>
-                    <input 
-                      type="text" 
-                      value={memoryPeople} 
-                      onChange={(e) => setMemoryPeople(e.target.value)} 
-                      className="w-full bg-transparent text-sm focus:outline-none dark:text-white placeholder:text-slate-400 dark:placeholder:text-slate-600" 
+                    <input
+                      type="text"
+                      value={memoryPeople}
+                      onChange={(e) => setMemoryPeople(e.target.value)}
+                      className="w-full bg-transparent text-sm focus:outline-none dark:text-white placeholder:text-slate-400 dark:placeholder:text-slate-600"
                       placeholder="John, Sarah..."
                     />
                   </div>
@@ -4613,14 +4151,14 @@ function AppContent() {
                     <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest">
                       Tags {tags.length > 0 && <span className="text-slate-500">({tags.length})</span>}
                     </label>
-                    <button 
+                    <button
                       onClick={() => setShowTagModal(true)}
                       className="text-xs font-semibold text-[#10a37f] active:text-[#1a7f64] transition-colors px-2 py-1"
                     >
                       + New
                     </button>
                   </div>
-                  
+
                   {tags.length === 0 ? (
                     <div className="text-center py-4">
                       <p className="text-xs text-slate-400 mb-1">No tags yet</p>
@@ -4632,16 +4170,15 @@ function AppContent() {
                         {tags.map(tag => {
                           const isSelected = selectedTags.find(t => t.id === tag.id)
                           const memoryCount = tag.memory_count || 0
-                          
+
                           return (
                             <div key={tag.id} className="relative group">
                               <button
                                 onClick={() => toggleTag(tag)}
-                                className={`relative px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-95 ${
-                                  isSelected
-                                    ? 'ring-2 ring-offset-1 dark:ring-offset-[#0d0d0d]'
-                                    : 'opacity-70 active:opacity-100'
-                                }`}
+                                className={`relative px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-95 ${isSelected
+                                  ? 'ring-2 ring-offset-1 dark:ring-offset-[#0d0d0d]'
+                                  : 'opacity-70 active:opacity-100'
+                                  }`}
                                 style={{
                                   backgroundColor: isSelected ? tag.color + '20' : 'transparent',
                                   color: tag.color,
@@ -4658,9 +4195,9 @@ function AppContent() {
                                   )}
                                   <span>{tag.name}</span>
                                   {memoryCount > 0 && (
-                                    <span 
+                                    <span
                                       className="text-[9px] px-1 py-0.5 rounded-full font-bold ml-0.5"
-                                      style={{ 
+                                      style={{
                                         backgroundColor: tag.color + '40',
                                         color: tag.color
                                       }}
@@ -4690,7 +4227,7 @@ function AppContent() {
                             <svg className="w-3.5 h-3.5 text-[#10a37f]" fill="currentColor" viewBox="0 0 20 20">
                               <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
                             </svg>
-                            <span className="font-semibold">Selected:</span> 
+                            <span className="font-semibold">Selected:</span>
                             <span className="truncate">{selectedTags.map(t => t.name).join(', ')}</span>
                           </p>
                         </div>
@@ -4701,8 +4238,8 @@ function AppContent() {
 
                 {/* Action Buttons */}
                 <div className="grid grid-cols-1 gap-3 pt-4 border-t border-slate-200 dark:border-white/10 pb-4">
-                  <button 
-                    onClick={uploadAndProcess} 
+                  <button
+                    onClick={uploadAndProcess}
                     className="w-full py-4 bg-[#10a37f] text-white text-sm font-bold rounded-xl shadow-lg shadow-[#10a37f]/30 active:bg-[#1a7f64] active:scale-[0.98] transition-all flex items-center justify-center gap-2"
                   >
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -4710,17 +4247,17 @@ function AppContent() {
                     </svg>
                     Save Memory
                   </button>
-                  <button 
+                  <button
                     onClick={async () => {
                       // Check if there are any changes or a file selected
-                      const hasChanges = selectedFile || 
-                                        memoryText.trim() || 
-                                        memoryTitle?.trim() || 
-                                        memoryTopic?.trim() || 
-                                        memoryMood !== null || 
-                                        memoryPeople?.trim() || 
-                                        selectedTags.length > 0
-                      
+                      const hasChanges = selectedFile ||
+                        memoryText.trim() ||
+                        memoryTitle?.trim() ||
+                        memoryTopic?.trim() ||
+                        memoryMood !== null ||
+                        memoryPeople?.trim() ||
+                        selectedTags.length > 0
+
                       if (hasChanges) {
                         const confirmed = await showConfirmation({
                           title: 'Discard Memory',
@@ -4731,7 +4268,7 @@ function AppContent() {
                         })
                         if (!confirmed) return
                       }
-                      
+
                       handleDiscardMemory()
                     }}
                     className="w-full py-3 text-slate-500 dark:text-white/40 font-semibold text-xs active:text-red-500 active:bg-red-50 dark:active:bg-red-500/10 rounded-lg transition-colors"
@@ -4746,18 +4283,11 @@ function AppContent() {
       </>
     )
   }
-  
+
   if (currentScreen === SCREENS.CREATE_TEXT_MEMORY) {
     return (
       <>
-        <ToastContainer />
-        <DateDetailsModal />
-        <LoginModal />
-        <SearchModal />
-        <ConfirmationModal />
-        <ProfileDialog />
-        <ConfirmationModal />
-        <ProfileDialog />
+        {globalModalsJSX}
         {showTagModal && (
           <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
             <div className="bg-white dark:bg-[#171717] rounded-2xl p-6 max-w-md w-full shadow-2xl border border-slate-200 dark:border-white/10">
@@ -4765,8 +4295,8 @@ function AppContent() {
               <div className="space-y-4">
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">Tag Name</label>
-                  <input 
-                    type="text" 
+                  <input
+                    type="text"
                     value={newTagName}
                     onChange={(e) => setNewTagName(e.target.value)}
                     placeholder="e.g., Work, Personal, Ideas"
@@ -4776,21 +4306,21 @@ function AppContent() {
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">Color</label>
-                  <input 
-                    type="color" 
+                  <input
+                    type="color"
                     value={newTagColor}
                     onChange={(e) => setNewTagColor(e.target.value)}
                     className="w-full h-12 rounded-xl cursor-pointer"
                   />
                 </div>
                 <div className="flex gap-3 pt-2">
-                  <button 
+                  <button
                     onClick={createTag}
                     className="flex-1 py-3 bg-[#10a37f] text-white font-semibold rounded-xl hover:bg-[#1a7f64] transition-colors"
                   >
                     Create Tag
                   </button>
-                  <button 
+                  <button
                     onClick={() => setShowTagModal(false)}
                     className="flex-1 py-3 bg-slate-100 dark:bg-white/5 text-slate-700 dark:text-white font-semibold rounded-xl hover:bg-slate-200 dark:hover:bg-white/10 transition-colors"
                   >
@@ -4801,22 +4331,22 @@ function AppContent() {
             </div>
           </div>
         )}
-        
+
         <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
           <div className="flex-1 flex flex-col min-w-0 h-[100dvh] overflow-hidden">
             <header className="h-14 lg:h-16 border-b border-slate-200 dark:border-white/10 px-4 lg:px-6 flex items-center justify-between bg-white/80 dark:bg-[#0d0d0d]/80 backdrop-blur-xl">
               <div className="flex items-center gap-3">
-                <button 
+                <button
                   onClick={async () => {
                     // Check if there are any changes
-                    const hasChanges = memoryText.trim() || 
-                                      memoryTitle?.trim() || 
-                                      memoryTopic?.trim() || 
-                                      memoryMood !== null || 
-                                      memoryPeople?.trim() || 
-                                      selectedTags.length > 0
-                    
+                    const hasChanges = memoryText.trim() ||
+                      memoryTitle?.trim() ||
+                      memoryTopic?.trim() ||
+                      memoryMood !== null ||
+                      memoryPeople?.trim() ||
+                      selectedTags.length > 0
+
                     if (hasChanges) {
                       const confirmed = await showConfirmation({
                         title: 'Discard Text Memory',
@@ -4827,7 +4357,7 @@ function AppContent() {
                       })
                       if (!confirmed) return
                     }
-                    
+
                     setMemoryTitle(null)
                     setHasEditedTitle(false)
                     setMemoryText('')
@@ -4836,7 +4366,7 @@ function AppContent() {
                     setMemoryPeople('')
                     setSelectedTags([])
                     setCurrentScreen(SCREENS.MAIN)
-                  }} 
+                  }}
                   className="p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors text-slate-500"
                 >
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -4862,10 +4392,10 @@ function AppContent() {
                       {new Date().toLocaleDateString('en-US', { weekday: 'long' })}
                     </div>
                     <div className="text-sm lg:text-base text-slate-500 dark:text-slate-400">
-                      {new Date().toLocaleDateString('en-US', { 
-                        month: 'long', 
-                        day: 'numeric', 
-                        year: 'numeric' 
+                      {new Date().toLocaleDateString('en-US', {
+                        month: 'long',
+                        day: 'numeric',
+                        year: 'numeric'
                       })}
                     </div>
                   </div>
@@ -4874,26 +4404,26 @@ function AppContent() {
                 {/* Title */}
                 <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border border-slate-200 dark:border-white/10">
                   <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">Title</label>
-                  <input 
-                    type="text" 
-                    value={memoryTitle || ''} 
+                  <input
+                    type="text"
+                    value={memoryTitle || ''}
                     onChange={(e) => {
                       setMemoryTitle(e.target.value)
                       setHasEditedTitle(true)
-                    }} 
+                    }}
                     placeholder="Enter a title for your memory..."
-                    className="w-full bg-transparent text-lg font-semibold focus:outline-none dark:text-white" 
+                    className="w-full bg-transparent text-lg font-bold focus:outline-none dark:text-white placeholder-slate-400 dark:placeholder-slate-500"
                   />
                 </div>
 
                 {/* Text Content */}
                 <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border border-slate-200 dark:border-white/10">
                   <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">Content *</label>
-                  <textarea 
-                    value={memoryText} 
-                    onChange={(e) => setMemoryText(e.target.value)} 
+                  <textarea
+                    value={memoryText}
+                    onChange={(e) => setMemoryText(e.target.value)}
                     placeholder="Write your memory here..."
-                    className="w-full bg-transparent text-sm focus:outline-none dark:text-white min-h-[300px] resize-none" 
+                    className="w-full bg-transparent text-sm focus:outline-none dark:text-white min-h-[300px] resize-none"
                   />
                   <p className="text-xs text-slate-400 mt-2">This is the main content of your text memory</p>
                 </div>
@@ -4902,12 +4432,12 @@ function AppContent() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border border-slate-200 dark:border-white/10">
                     <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">Topic</label>
-                    <input 
-                      type="text" 
-                      value={memoryTopic} 
-                      onChange={(e) => setMemoryTopic(e.target.value)} 
+                    <input
+                      type="text"
+                      value={memoryTopic}
+                      onChange={(e) => setMemoryTopic(e.target.value)}
                       placeholder="e.g., Work, Personal, Ideas"
-                      className="w-full bg-transparent text-sm focus:outline-none dark:text-white" 
+                      className="w-full bg-transparent text-sm font-medium focus:outline-none dark:text-white placeholder-slate-400 dark:placeholder-slate-500"
                     />
                   </div>
 
@@ -4919,11 +4449,10 @@ function AppContent() {
                           key={mood}
                           type="button"
                           onClick={() => setMemoryMood(memoryMood === mood ? null : mood)}
-                          className={`flex-1 py-2 rounded-lg text-lg transition-all ${
-                            memoryMood === mood 
-                              ? 'bg-[#10a37f] shadow-md scale-110' 
-                              : 'bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10'
-                          }`}
+                          className={`flex-1 py-2 rounded-lg text-lg transition-all ${memoryMood === mood
+                            ? 'bg-[#10a37f] shadow-md scale-110'
+                            : 'bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10'
+                            }`}
                         >
                           {['😢', '😕', '😐', '🙂', '😄'][mood - 1]}
                         </button>
@@ -4934,12 +4463,12 @@ function AppContent() {
 
                 <div className="p-4 bg-slate-50 dark:bg-white/5 rounded-2xl border border-slate-200 dark:border-white/10">
                   <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-2">People</label>
-                  <input 
-                    type="text" 
-                    value={memoryPeople} 
-                    onChange={(e) => setMemoryPeople(e.target.value)} 
+                  <input
+                    type="text"
+                    value={memoryPeople}
+                    onChange={(e) => setMemoryPeople(e.target.value)}
                     placeholder="John, Sarah, ..."
-                    className="w-full bg-transparent text-sm focus:outline-none dark:text-white" 
+                    className="w-full bg-transparent text-sm focus:outline-none dark:text-white"
                   />
                 </div>
 
@@ -4965,11 +4494,10 @@ function AppContent() {
                         <button
                           key={tag.id}
                           onClick={() => toggleTag(tag)}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                            selectedTags.find(t => t.id === tag.id)
-                              ? 'bg-[#10a37f] text-white shadow-md'
-                              : 'bg-white dark:bg-white/5 text-slate-600 dark:text-slate-400 border border-slate-200 dark:border-white/10 hover:border-[#10a37f]'
-                          }`}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${selectedTags.find(t => t.id === tag.id)
+                            ? 'bg-[#10a37f] text-white shadow-md'
+                            : 'bg-white dark:bg-white/5 text-slate-600 dark:text-slate-400 border border-slate-200 dark:border-white/10 hover:border-[#10a37f]'
+                            }`}
                           style={selectedTags.find(t => t.id === tag.id) ? {} : { borderColor: tag.color + '40' }}
                         >
                           {tag.name}
@@ -4981,7 +4509,7 @@ function AppContent() {
 
                 {/* Action Buttons */}
                 <div className="flex gap-3 pt-4">
-                  <button 
+                  <button
                     onClick={createTextMemory}
                     disabled={!memoryText.trim()}
                     className="flex-1 py-3 bg-[#10a37f] text-white font-semibold rounded-xl hover:bg-[#1a7f64] transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
@@ -4991,16 +4519,16 @@ function AppContent() {
                     </svg>
                     Create Memory
                   </button>
-                  <button 
+                  <button
                     onClick={async () => {
                       // Check if there are any changes
-                      const hasChanges = memoryText.trim() || 
-                                        memoryTitle?.trim() || 
-                                        memoryTopic?.trim() || 
-                                        memoryMood !== null || 
-                                        memoryPeople?.trim() || 
-                                        selectedTags.length > 0
-                      
+                      const hasChanges = memoryText.trim() ||
+                        memoryTitle?.trim() ||
+                        memoryTopic?.trim() ||
+                        memoryMood !== null ||
+                        memoryPeople?.trim() ||
+                        selectedTags.length > 0
+
                       if (hasChanges) {
                         const confirmed = await showConfirmation({
                           title: 'Discard Text Memory',
@@ -5011,7 +4539,7 @@ function AppContent() {
                         })
                         if (!confirmed) return
                       }
-                      
+
                       setMemoryTitle(null)
                       setHasEditedTitle(false)
                       setMemoryText('')
@@ -5034,17 +4562,131 @@ function AppContent() {
     )
   }
 
+  if (currentScreen === SCREENS.CALENDAR) {
+    return (
+      <>
+        {globalModalsJSX}
+        <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
+          {sidebarJSX}
+          <div className="flex-1 flex flex-col min-w-0 bg-white dark:bg-[#0d0d0d]">
+            <header className="h-14 lg:h-16 border-b border-slate-200 dark:border-white/10 px-4 lg:px-6 flex items-center justify-between bg-white dark:bg-[#0d0d0d] sticky top-0 z-40">
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={() => setSidebarOpen(!sidebarOpen)}
+                  className="p-2 hover:bg-slate-100 dark:hover:bg-white/10 rounded-lg transition-colors text-slate-500"
+                  title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+                >
+                  {sidebarOpen ? (
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7m8 14l-7-7 7-7" /></svg>
+                  ) : (
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
+                  )}
+                </button>
+                <h1 className="text-xl font-bold dark:text-white uppercase tracking-tight">Calendar</h1>
+              </div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-lg font-semibold dark:text-white mr-4">
+                  {calendarDate.toLocaleString('default', { month: 'long', year: 'numeric' })}
+                </h2>
+                <div className="flex bg-slate-100 dark:bg-white/5 rounded-xl p-1">
+                  <button
+                    onClick={() => changeMonth(-1)}
+                    className="p-1.5 hover:bg-white dark:hover:bg-white/10 rounded-lg transition-all shadow-sm"
+                  >
+                    <svg className="w-5 h-5 text-slate-600 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+                    </svg>
+                  </button>
+                  <button
+                    onClick={() => {
+                      const today = new Date()
+                      setCalendarDate(today)
+                      fetchCalendarData(today)
+                    }}
+                    className="px-3 py-1.5 text-xs font-bold text-slate-600 dark:text-slate-300 hover:text-[#10a37f] transition-colors"
+                  >
+                    Today
+                  </button>
+                  <button
+                    onClick={() => changeMonth(1)}
+                    className="p-1.5 hover:bg-white dark:hover:bg-white/10 rounded-lg transition-all shadow-sm"
+                  >
+                    <svg className="w-5 h-5 text-slate-600 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+            </header>
+
+            <div className="flex-1 overflow-auto flex flex-col">
+              {/* Calendar Grid */}
+              <div className="flex-1 grid grid-cols-7 grid-rows-6 min-h-[600px]">
+                {getCalendarDays(calendarDate).map((date, idx) => {
+                  const emojis = date ? getEmojisForDate(date) : []
+                  const today = date && isToday(date)
+                  const isCurrentMonth = date && date.getMonth() === calendarDate.getMonth()
+
+                  return (
+                    <div
+                      key={idx}
+                      onClick={() => date && handleDateClick(date)}
+                      className={`
+                        border-r border-b border-slate-200 dark:border-white/10 p-2 lg:p-4
+                        flex flex-col items-center relative group transition-colors overflow-hidden
+                        ${date ? 'hover:bg-slate-50 dark:hover:bg-white/[0.02] cursor-pointer' : 'bg-slate-50/50 dark:bg-white/[0.01]'}
+                      `}
+                    >
+                      {date && (
+                        <>
+                          {idx < 7 && (
+                            <div className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase mb-1">
+                              {['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'][idx]}
+                            </div>
+                          )}
+                          <div className="flex justify-center mb-2">
+                            <span className={`
+                              px-2 h-8 flex items-center justify-center rounded-full text-sm transition-all
+                              ${today
+                                ? 'bg-blue-600 text-white font-bold shadow-lg ring-4 ring-blue-600/20'
+                                : isCurrentMonth ? 'text-slate-900 dark:text-white font-medium' : 'text-slate-400 dark:text-slate-600'}
+                            `}>
+                              {date.getDate() === 1 ? `${date.toLocaleString('default', { month: 'short' })} 1` : date.getDate()}
+                            </span>
+                          </div>
+
+                          <div className="flex-1 flex flex-wrap items-center justify-center gap-2 overflow-hidden pointer-events-none">
+                            {emojis.map((emoji, eIdx) => (
+                              <div key={eIdx} className="text-4xl lg:text-5xl animate-in zoom-in duration-300 transform group-hover:scale-110 transition-transform">
+                                {emoji}
+                              </div>
+                            ))}
+
+                            {emojis.length === 0 && isCurrentMonth && (
+                              <div className="opacity-0 group-hover:opacity-100 transition-opacity bg-slate-100 dark:bg-white/10 rounded-full p-2 text-slate-400">
+                                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                                </svg>
+                              </div>
+                            )}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      </>
+    )
+  }
+
   if (currentScreen === SCREENS.MAIN) {
     return (
       <>
-        <ToastContainer />
-        <DateDetailsModal />
-        <LoginModal />
-        <SearchModal />
-        <ConfirmationModal />
-        <ProfileDialog />
-        <ConfirmationModal />
-        <ProfileDialog />
+        {globalModalsJSX}
         <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
           <div className="flex-1 flex flex-col min-w-0 h-[100dvh] overflow-hidden">
@@ -5082,27 +4724,32 @@ function AppContent() {
                       </>
                     ) : (
                       <>
-                        <h3 className="text-2xl lg:text-3xl font-bold mb-4 dark:text-white">I'm here.</h3>
-                        <p className="text-sm lg:text-base text-slate-500 dark:text-slate-400 max-w-md mx-auto leading-relaxed mb-8">Would you like to check in again, or look back at recent patterns?</p>
-                        <div className="flex flex-wrap items-center justify-center gap-3 max-w-2xl mx-auto">
-                          <button
-                            onClick={() => setInputQuery("Summarize my recent memories")}
-                            className="px-4 py-2.5 bg-white/5 dark:bg-white/5 border border-slate-200/50 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-white/10 dark:hover:bg-white/10 transition-all text-sm font-medium"
-                          >
-                            Summarize my recent memories
-                          </button>
-                          <button
-                            onClick={() => setInputQuery("What patterns do you notice in my reflections?")}
-                            className="px-4 py-2.5 bg-white/5 dark:bg-white/5 border border-slate-200/50 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-white/10 dark:hover:bg-white/10 transition-all text-sm font-medium"
-                          >
-                            What patterns do you notice?
-                          </button>
-                          <button
-                            onClick={() => setInputQuery("How have I been feeling lately?")}
-                            className="px-4 py-2.5 bg-white/5 dark:bg-white/5 border border-slate-200/50 dark:border-white/10 text-slate-700 dark:text-white rounded-xl hover:bg-white/10 dark:hover:bg-white/10 transition-all text-sm font-medium"
-                          >
-                            How have I been feeling lately?
-                          </button>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-2xl mx-auto">
+                          {[
+                            { title: 'Summarize', desc: 'Recap my recent transcriptions', query: 'Summarize my recent memories', icon: '📝', color: 'bg-blue-500/10 text-blue-500' },
+                            { title: 'Analyze Patterns', desc: 'What themes are emerging?', query: 'What patterns do you notice in my reflections?', icon: '🔍', color: 'bg-purple-500/10 text-purple-500' },
+                            { title: 'Track Mood', desc: 'How have I been lately?', query: 'How have I been feeling lately?', icon: '🎭', color: 'bg-amber-500/10 text-amber-500' },
+                            { title: 'Action Items', desc: 'What should I do next?', query: 'What should I focus on this week?', icon: '⚡', color: 'bg-[#10a37f]/10 text-[#10a37f]' }
+                          ].map((item, idx) => (
+                            <button
+                              key={idx}
+                              onClick={() => setInputQuery(item.query)}
+                              className="group p-4 bg-white dark:bg-white/5 border border-slate-200/60 dark:border-white/10 rounded-2xl hover:bg-slate-50 dark:hover:bg-white/[0.08] hover:border-[#10a37f]/30 dark:hover:border-[#10a37f]/30 transition-all duration-300 text-left relative overflow-hidden active:scale-[0.98]"
+                            >
+                              <div className="flex items-start gap-3">
+                                <div className={`w-10 h-10 rounded-xl ${item.color} flex items-center justify-center text-xl group-hover:scale-110 transition-transform duration-300`}>
+                                  {item.icon}
+                                </div>
+                                <div className="flex-1 min-w-0 pt-0.5">
+                                  <div className="text-[15px] font-bold text-slate-800 dark:text-white mb-0.5">{item.title}</div>
+                                  <div className="text-[13px] text-slate-500 dark:text-slate-400 line-clamp-1">{item.desc}</div>
+                                </div>
+                              </div>
+                              <div className="absolute right-3 bottom-3 opacity-0 group-hover:opacity-100 transition-opacity translate-x-1 group-hover:translate-x-0">
+                                <svg className="w-4 h-4 text-[#10a37f]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
+                              </div>
+                            </button>
+                          ))}
                         </div>
                       </>
                     )}
@@ -5136,28 +4783,28 @@ function AppContent() {
             </div>
             <div className="px-4 lg:px-8 pb-6 pb-safe-bottom pt-2 bg-gradient-to-t from-white dark:from-[#0d0d0d] via-white/95 dark:via-[#0d0d0d]/95 to-transparent">
               <div className="max-w-3xl mx-auto">
-                <div className="relative">
-                  {/* Create Memory Dropdown Button - Perfectly aligned */}
-                  <div className="absolute left-3 top-1/2 -translate-y-1/2 z-10 create-memory-dropdown">
+                {/* Cohesive Input Container */}
+                <div className="relative flex items-end bg-white dark:bg-[#1a1a1a] border border-slate-200 dark:border-white/10 rounded-[28px] shadow-sm hover:shadow-md focus-within:shadow-xl focus-within:border-[#10a37f]/50 dark:focus-within:border-[#10a37f]/50 transition-all duration-300">
+                  {/* Create Memory Dropdown Button - Positioned inside */}
+                  <div className="absolute left-2 bottom-2 z-10 create-memory-dropdown">
                     <button
                       onClick={() => setShowCreateMemoryDropdown(!showCreateMemoryDropdown)}
-                      className={`w-9 h-9 flex items-center justify-center rounded-xl transition-all duration-200 ${
-                        showCreateMemoryDropdown
-                          ? 'bg-[#10a37f]/10 dark:bg-[#10a37f]/20 text-[#10a37f] shadow-sm'
-                          : 'bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-white/10 hover:text-slate-700 dark:hover:text-slate-300'
-                      }`}
+                      className={`w-10 h-10 flex items-center justify-center rounded-full transition-all duration-200 ${showCreateMemoryDropdown
+                        ? 'bg-[#10a37f] text-white shadow-md'
+                        : 'text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-white/10'
+                        }`}
                       title="Create Memory"
                     >
-                      <svg className="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2.5}>
+                      <svg className="w-5 h-5 transition-transform duration-200" style={{ transform: showCreateMemoryDropdown ? 'rotate(45deg)' : 'none' }} fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2.5}>
                         <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
                       </svg>
                     </button>
-                    
+
                     {showCreateMemoryDropdown && (
-                      <div className="absolute bottom-full left-0 mb-2 w-72 bg-white dark:bg-[#1f1f1f] border border-slate-200 dark:border-white/10 rounded-2xl shadow-xl overflow-hidden z-50 backdrop-blur-xl">
+                      <div className="absolute bottom-full left-0 mb-3 w-72 bg-white dark:bg-[#262626] border border-slate-200 dark:border-white/10 rounded-2xl shadow-2xl overflow-hidden z-50 backdrop-blur-xl animate-in fade-in slide-in-from-bottom-2 duration-200">
                         <div className="p-2">
-                          <div className="px-3 py-2 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-1">
-                            Create Memory
+                          <div className="px-3 py-2 text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-1">
+                            Actions
                           </div>
                           <button
                             onClick={async () => {
@@ -5166,17 +4813,17 @@ function AppContent() {
                                 setShowCreateMemoryDropdown(false)
                               }
                             }}
-                            className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-slate-50 dark:hover:bg-white/5 transition-all duration-150 text-left group"
+                            className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-slate-50 dark:hover:bg-white/5 transition-all duration-150 text-left group/item"
                           >
-                            <div className="w-10 h-10 rounded-xl bg-[#10a37f]/10 dark:bg-[#10a37f]/20 flex items-center justify-center group-hover:bg-[#10a37f]/20 dark:group-hover:bg-[#10a37f]/30 transition-colors">
-                              <svg className="w-5 h-5 text-[#10a37f] flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">
-                                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
-                                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                            <div className="w-10 h-10 rounded-xl bg-[#10a37f]/10 dark:bg-[#10a37f]/20 flex items-center justify-center group-hover/item:bg-[#10a37f]/20 dark:group-hover/item:bg-[#10a37f]/30 transition-colors">
+                              <svg className="w-5 h-5 text-[#10a37f]" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
+                                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
                               </svg>
                             </div>
                             <div className="flex-1 min-w-0">
-                              <div className="text-sm font-semibold text-slate-900 dark:text-white">Record</div>
-                              <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Record audio memory</div>
+                              <div className="text-sm font-semibold text-slate-700 dark:text-white">Record Audio</div>
+                              <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">Capture a new memory by voice</div>
                             </div>
                           </button>
                           <button
@@ -5186,16 +4833,16 @@ function AppContent() {
                                 setShowCreateMemoryDropdown(false)
                               }
                             }}
-                            className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-slate-50 dark:hover:bg-white/5 transition-all duration-150 text-left group"
+                            className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-slate-50 dark:hover:bg-white/5 transition-all duration-150 text-left group/item"
                           >
-                            <div className="w-10 h-10 rounded-xl bg-[#10a37f]/10 dark:bg-[#10a37f]/20 flex items-center justify-center group-hover:bg-[#10a37f]/20 dark:group-hover:bg-[#10a37f]/30 transition-colors">
-                              <svg className="w-5 h-5 text-[#10a37f] flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                            <div className="w-10 h-10 rounded-xl bg-blue-500/10 dark:bg-blue-500/20 flex items-center justify-center group-hover/item:bg-blue-500/20 dark:group-hover/item:bg-blue-500/30 transition-colors">
+                              <svg className="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                               </svg>
                             </div>
                             <div className="flex-1 min-w-0">
-                              <div className="text-sm font-semibold text-slate-900 dark:text-white">Upload</div>
-                              <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Upload audio or video</div>
+                              <div className="text-sm font-semibold text-slate-700 dark:text-white">Upload File</div>
+                              <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">Import audio or video files</div>
                             </div>
                           </button>
                           <button
@@ -5205,52 +4852,57 @@ function AppContent() {
                                 setShowCreateMemoryDropdown(false)
                               }
                             }}
-                            className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-slate-50 dark:hover:bg-white/5 transition-all duration-150 text-left group"
+                            className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-slate-50 dark:hover:bg-white/5 transition-all duration-150 text-left group/item"
                           >
-                            <div className="w-10 h-10 rounded-xl bg-blue-500/10 dark:bg-blue-500/20 flex items-center justify-center group-hover:bg-blue-500/20 dark:group-hover:bg-blue-500/30 transition-colors">
-                              <svg className="w-5 h-5 text-blue-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
+                            <div className="w-10 h-10 rounded-xl bg-purple-500/10 dark:bg-purple-500/20 flex items-center justify-center group-hover/item:bg-purple-500/20 dark:group-hover/item:bg-purple-500/30 transition-colors">
+                              <svg className="w-5 h-5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2}>
                                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                               </svg>
                             </div>
                             <div className="flex-1 min-w-0">
-                              <div className="text-sm font-semibold text-slate-900 dark:text-white">Write Memory</div>
-                              <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">Create text memory</div>
+                              <div className="text-sm font-semibold text-slate-700 dark:text-white">Write Memory</div>
+                              <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">Create a text-only memory</div>
                             </div>
                           </button>
                         </div>
                       </div>
                     )}
                   </div>
-                  
-                  {/* Unique styled text input field */}
-                  <div className="relative group">
-                    <textarea 
-                      value={inputQuery} 
-                      onChange={(e) => setInputQuery(e.target.value)} 
-                      onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), askQuestion())} 
-                      placeholder="Type your message..." 
-                      className="w-full pl-14 pr-14 py-4 bg-white dark:bg-[#1a1a1a] border-2 border-slate-200 dark:border-white/10 rounded-2xl shadow-sm focus:shadow-lg focus:border-[#10a37f] dark:focus:border-[#10a37f] transition-all duration-200 resize-none text-[15px] leading-relaxed placeholder-slate-400 dark:placeholder-slate-500 dark:text-white focus:outline-none focus:ring-0" 
-                      rows="1" 
-                      style={{
-                        boxShadow: inputQuery.trim() 
-                          ? '0 4px 6px -1px rgba(16, 163, 127, 0.1), 0 2px 4px -1px rgba(16, 163, 127, 0.06)' 
-                          : '0 1px 2px 0 rgba(0, 0, 0, 0.05)'
-                      }}
-                    />
-                    
-                    {/* Send button - redesigned */}
-                    <button 
-                      onClick={askQuestion} 
-                      disabled={!inputQuery.trim() || isThinking} 
-                      className={`absolute right-3 top-1/2 -translate-y-1/2 w-9 h-9 flex items-center justify-center rounded-xl transition-all duration-200 ${
-                        inputQuery.trim() && !isThinking
-                          ? 'bg-[#10a37f] text-white shadow-md shadow-[#10a37f]/30 hover:bg-[#0d8a6a] hover:shadow-lg hover:shadow-[#10a37f]/40 active:scale-95'
-                          : 'bg-slate-100 dark:bg-white/5 text-slate-400 dark:text-slate-500 cursor-not-allowed'
-                      }`}
+
+                  <textarea
+                    ref={textareaRef}
+                    value={inputQuery}
+                    onChange={(e) => setInputQuery(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), askQuestion())}
+                    placeholder="Message AudioRag..."
+                    className="w-full pl-14 pr-14 py-[14px] bg-transparent border-none resize-none text-[16px] leading-[1.6] placeholder-slate-400 dark:placeholder-slate-500 dark:text-white/90 focus:outline-none focus:ring-0 overflow-y-auto min-h-[56px]"
+                    rows="1"
+                    style={{
+                      maxHeight: '300px',
+                    }}
+                  />
+
+                  {/* Send button - ChatGPT style */}
+                  <div className="absolute right-2 bottom-2">
+                    <button
+                      onClick={askQuestion}
+                      disabled={!inputQuery.trim() || isThinking}
+                      className={`w-10 h-10 flex items-center justify-center rounded-full transition-all duration-300 ${inputQuery.trim() && !isThinking
+                        ? 'bg-[#10a37f] text-white shadow-md hover:bg-[#0d8a6a] hover:scale-105 active:scale-95'
+                        : 'bg-slate-100 dark:bg-white/5 text-slate-300 dark:text-white/10'
+                        }`}
                     >
-                      <svg className="w-4.5 h-4.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={2.5}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M13 7l5 5m0 0l-5 5m5-5H6" />
-                      </svg>
+                      {isThinking ? (
+                        <div className="flex items-center gap-1.5">
+                          <div className="w-1.5 h-1.5 bg-white rounded-full animate-bounce [animation-duration:0.6s]"></div>
+                          <div className="w-1.5 h-1.5 bg-white rounded-full animate-bounce [animation-duration:0.6s] [animation-delay:0.2s]"></div>
+                          <div className="w-1.5 h-1.5 bg-white rounded-full animate-bounce [animation-duration:0.6s] [animation-delay:0.4s]"></div>
+                        </div>
+                      ) : (
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={3}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M5 10l7-7m0 0l7 7m-7-7v18" />
+                        </svg>
+                      )}
                     </button>
                   </div>
                 </div>
@@ -5266,14 +4918,7 @@ function AppContent() {
   if (currentScreen === SCREENS.RECORD) {
     return (
       <>
-        <ToastContainer />
-        <DateDetailsModal />
-        <LoginModal />
-        <SearchModal />
-        <ConfirmationModal />
-        <ProfileDialog />
-        <ConfirmationModal />
-        <ProfileDialog />
+        {globalModalsJSX}
         <div className="h-[100dvh] flex bg-[#0d0d0d] text-white overflow-hidden">
           <main className="flex-1 flex flex-col items-center justify-center p-6 relative">
             <button onClick={cancelRecording} className="absolute top-8 left-8 p-3 hover:bg-white/10 rounded-2xl transition-all active:scale-90"><svg className="w-6 h-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
@@ -5281,7 +4926,7 @@ function AppContent() {
             {errorMessage && (<div className="mb-8 px-6 py-4 bg-red-500/10 border border-red-500/20 rounded-2xl max-w-md text-center"><p className="text-red-400 text-sm font-medium">{errorMessage}</p><button onClick={() => setErrorMessage('')} className="mt-2 text-xs text-red-400/70 hover:text-red-400 underline">Dismiss</button></div>)}
             <div className="flex items-center gap-2 mb-12 h-20">{[...Array(32)].map((_, i) => (<div key={i} className={`wave-bar ${isRecording ? '' : 'opacity-20 animate-none !h-1'}`}></div>))}</div>
             <div className="text-8xl font-light mb-16 tabular-nums tracking-tighter text-white animate-pulse">{formatTime(recordingTime)}</div>
-            <div className="flex flex-col items-center gap-8"><button onClick={isRecording ? stopRecording : startRecording} className={`w-24 h-24 rounded-[2.5rem] flex items-center justify-center transition-all shadow-2xl active:scale-95 ${isRecording ? 'bg-red-500 hover:bg-red-600' : 'bg-[#10a37f] hover:bg-[#1a7f64] shadow-[#10a37f]/20'}`}>{isRecording ? (<div className="w-8 h-8 bg-white rounded-lg"></div>) : (<svg className="w-10 h-10 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>)}</button><p className="text-slate-400 text-sm font-bold tracking-widest uppercase">{isRecording ? 'Recording Live...' : 'Tap to Start'}</p></div>
+            <div className="flex flex-col items-center gap-8"><button onClick={isRecording ? stopRecording : startRecording} className={`w-24 h-24 rounded-[2.5rem] flex items-center justify-center transition-all shadow-2xl active:scale-95 ${isRecording ? 'bg-red-500 hover:bg-red-600' : 'bg-[#10a37f] hover:bg-[#1a7f64] shadow-[#10a37f]/20'}`}>{isRecording ? (<div className="w-8 h-8 bg-white rounded-lg"></div>) : (<svg className="w-10 h-10 text-white" fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" /><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" /></svg>)}</button><p className="text-slate-400 text-sm font-bold tracking-widest uppercase">{isRecording ? 'Recording Live...' : 'Tap to Start'}</p></div>
           </main>
         </div>
       </>
@@ -5291,14 +4936,7 @@ function AppContent() {
   if (currentScreen === SCREENS.UPLOAD) {
     return (
       <>
-        <ToastContainer />
-        <DateDetailsModal />
-        <LoginModal />
-        <SearchModal />
-        <ConfirmationModal />
-        <ProfileDialog />
-        <ConfirmationModal />
-        <ProfileDialog />
+        {globalModalsJSX}
         <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] overflow-hidden">
           {sidebarJSX}
           <div className="flex-1 flex flex-col min-w-0">
@@ -5313,14 +4951,7 @@ function AppContent() {
   if (currentScreen === SCREENS.PROCESSING) {
     return (
       <>
-        <ToastContainer />
-        <DateDetailsModal />
-        <LoginModal />
-        <SearchModal />
-        <ConfirmationModal />
-        <ProfileDialog />
-        <ConfirmationModal />
-        <ProfileDialog />
+        {globalModalsJSX}
         <div className="h-[100dvh] flex bg-white dark:bg-[#0d0d0d] items-center justify-center p-6 overflow-hidden">
           <div className="text-center max-w-xs animate-fade-in">
             <div className="relative w-24 h-24 mx-auto mb-10">
@@ -5351,16 +4982,16 @@ function AppContent() {
               </div>
             )}
             <div className="w-full bg-slate-100 dark:bg-white/5 h-1.5 rounded-full overflow-hidden">
-              <div 
-                className="h-full bg-[#10a37f] transition-all duration-300" 
-                style={{ 
-                  width: processStatus === PROCESS_STATUS.UPLOADING 
+              <div
+                className="h-full bg-[#10a37f] transition-all duration-300"
+                style={{
+                  width: processStatus === PROCESS_STATUS.UPLOADING
                     ? `${Math.max(uploadProgress, 5)}%` // Show at least 5% during upload
-                    : processStatus === PROCESS_STATUS.TRANSCRIBING 
-                    ? '60%' 
-                    : processStatus === PROCESS_STATUS.INDEXING
-                    ? '90%'
-                    : '100%'
+                    : processStatus === PROCESS_STATUS.TRANSCRIBING
+                      ? '60%'
+                      : processStatus === PROCESS_STATUS.INDEXING
+                        ? '90%'
+                        : '100%'
                 }}
               ></div>
             </div>
@@ -5376,14 +5007,14 @@ function AppContent() {
         <div className="absolute inset-0 bg-gradient-to-br from-[#10a37f]/5 via-transparent to-transparent pointer-events-none" />
         <div className="text-center max-w-md w-full z-10 animate-fade-in">
           {authLoading ? (
-            <div className="space-y-6"><div className="relative w-20 h-20 mx-auto"><div className="absolute inset-0 border-4 border-[#10a37f]/10 rounded-[2rem]"></div><div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-[2rem] animate-spin"></div><div className="absolute inset-0 flex items-center justify-center"><svg className="w-8 h-8 text-[#10a37f]" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><circle cx="8.5" cy="10.5" r="1.5" fill="currentColor"/><circle cx="12" cy="10.5" r="1.5" fill="currentColor"/><circle cx="15.5" cy="10.5" r="1.5" fill="currentColor"/></svg></div></div><p className="text-sm text-slate-500 dark:text-slate-400">Loading...</p></div>
+            <div className="space-y-6"><div className="relative w-20 h-20 mx-auto"><div className="absolute inset-0 border-4 border-[#10a37f]/10 rounded-[2rem]"></div><div className="absolute inset-0 border-t-4 border-[#10a37f] rounded-[2rem] animate-spin"></div><div className="absolute inset-0 flex items-center justify-center"><svg className="w-8 h-8 text-[#10a37f]" fill="currentColor" viewBox="0 0 24 24"><path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><circle cx="8.5" cy="10.5" r="1.5" fill="currentColor" /><circle cx="12" cy="10.5" r="1.5" fill="currentColor" /><circle cx="15.5" cy="10.5" r="1.5" fill="currentColor" /></svg></div></div><p className="text-sm text-slate-500 dark:text-slate-400">Loading...</p></div>
           ) : (
             <>
-              <div className="w-20 h-20 lg:w-24 lg:h-24 bg-gradient-to-br from-[#10a37f] to-[#0d8a6a] rounded-2xl lg:rounded-3xl flex items-center justify-center mx-auto mb-8 text-white shadow-lg shadow-[#10a37f]/30"><svg className="w-10 h-10 lg:w-12 lg:h-12" viewBox="0 0 24 24" fill="none"><path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/><circle cx="8.5" cy="10.5" r="1.5" fill="currentColor"/><circle cx="12" cy="10.5" r="1.5" fill="currentColor"/><circle cx="15.5" cy="10.5" r="1.5" fill="currentColor"/></svg></div>
+              <div className="w-20 h-20 lg:w-24 lg:h-24 bg-gradient-to-br from-[#10a37f] to-[#0d8a6a] rounded-2xl lg:rounded-3xl flex items-center justify-center mx-auto mb-8 text-white shadow-lg shadow-[#10a37f]/30"><svg className="w-10 h-10 lg:w-12 lg:h-12" viewBox="0 0 24 24" fill="none"><path d="M12 3C7.5 3 4 6.5 4 10.5C4 14.5 7.5 18 12 18C12 18 12 21 12 21C12 21 17 17 17 17C19.5 15.5 21 13 21 10.5C21 6.5 17.5 3 12 3Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /><circle cx="8.5" cy="10.5" r="1.5" fill="currentColor" /><circle cx="12" cy="10.5" r="1.5" fill="currentColor" /><circle cx="15.5" cy="10.5" r="1.5" fill="currentColor" /></svg></div>
               <h1 className="text-3xl lg:text-4xl font-bold mb-3 tracking-tight dark:text-white">Welcome to Zentra Journal</h1>
               <p className="text-base text-slate-500 dark:text-slate-400 mb-10 max-w-sm mx-auto">Sign in to access your audio recordings and AI-powered insights</p>
               {errorMessage && (<div className="mb-6 px-4 py-3 bg-red-500/10 border border-red-500/20 rounded-xl text-center"><p className="text-red-500 text-sm font-medium">{errorMessage}</p></div>)}
-              <button onClick={handleGoogleSignIn} className="w-full flex items-center justify-center gap-3 px-6 py-4 bg-white dark:bg-[#171717] border-2 border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-2xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 dark:hover:bg-[#10a37f]/10 transition-all font-semibold shadow-lg active:scale-[0.98]"><svg className="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg><span>Continue with Google</span></button>
+              <button onClick={handleGoogleSignIn} className="w-full flex items-center justify-center gap-3 px-6 py-4 bg-white dark:bg-[#171717] border-2 border-slate-200 dark:border-white/10 text-slate-700 dark:text-white rounded-2xl hover:border-[#10a37f] hover:bg-[#10a37f]/5 dark:hover:bg-[#10a37f]/10 transition-all font-semibold shadow-lg active:scale-[0.98]"><svg className="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" /><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" /><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" /><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" /></svg><span>Continue with Google</span></button>
               <p className="mt-8 text-xs text-slate-400 dark:text-slate-500">By signing in, you agree to our Terms of Service and Privacy Policy</p>
             </>
           )}
@@ -5394,6 +5025,101 @@ function AppContent() {
 
   return null
 }
+
+// Global Modals component to keep AppContent clean and improve performance
+const GlobalModals = memo(({
+  toasts,
+  showDateDetailsModal,
+  selectedDateDetails,
+  setShowDateDetailsModal,
+  viewMemoryDetail,
+  showLoginModal,
+  setShowLoginModal,
+  setHasDismissedLoginPrompt,
+  shouldShakeLogin,
+  handleGoogleSignIn,
+  showSearchModal,
+  setShowSearchModal,
+  searchQuery,
+  setSearchQuery,
+  searchResults,
+  isSearching,
+  loadConversation,
+  confirmationModal,
+  showProfileDialog,
+  setShowProfileDialog,
+  user,
+  imageError,
+  setImageError,
+  getUserInitials,
+  handleSignOut,
+  authLoading,
+  hasDismissedSideCard,
+  setHasDismissedSideCard,
+  guestMessageCount,
+  showCenteredModal,
+  setShowCenteredModal,
+  setLoginPromptCooldownActive,
+  setModalDismissTime
+}) => {
+  return (
+    <>
+      <ToastContainer toasts={toasts} />
+      <DateDetailsModal
+        showDateDetailsModal={showDateDetailsModal}
+        selectedDateDetails={selectedDateDetails}
+        setShowDateDetailsModal={setShowDateDetailsModal}
+        viewMemoryDetail={viewMemoryDetail}
+      />
+      <SideLoginCard
+        user={user}
+        authLoading={authLoading}
+        hasDismissedSideCard={hasDismissedSideCard}
+        setHasDismissedSideCard={setHasDismissedSideCard}
+        guestMessageCount={guestMessageCount}
+        handleGoogleSignIn={handleGoogleSignIn}
+      />
+      <CenteredLoginModal
+        showCenteredModal={showCenteredModal}
+        setShowCenteredModal={setShowCenteredModal}
+        user={user}
+        setLoginPromptCooldownActive={setLoginPromptCooldownActive}
+        setModalDismissTime={setModalDismissTime}
+        guestMessageCount={guestMessageCount}
+        handleGoogleSignIn={handleGoogleSignIn}
+      />
+      <LoginModal
+        showLoginModal={showLoginModal}
+        setShowLoginModal={setShowLoginModal}
+        setHasDismissedLoginPrompt={setHasDismissedLoginPrompt}
+        shouldShakeLogin={shouldShakeLogin}
+        handleGoogleSignIn={handleGoogleSignIn}
+      />
+      <SearchModal
+        showSearchModal={showSearchModal}
+        setShowSearchModal={setShowSearchModal}
+        searchQuery={searchQuery}
+        setSearchQuery={setSearchQuery}
+        searchResults={searchResults}
+        isSearching={isSearching}
+        loadConversation={loadConversation}
+        viewMemoryDetail={viewMemoryDetail}
+      />
+      <ConfirmationModal confirmationModal={confirmationModal} />
+      <ProfileDialog
+        showProfileDialog={showProfileDialog}
+        setShowProfileDialog={setShowProfileDialog}
+        user={user}
+        imageError={imageError}
+        setImageError={setImageError}
+        getUserInitials={getUserInitials}
+        handleSignOut={handleSignOut}
+      />
+    </>
+  )
+})
+
+GlobalModals.displayName = 'GlobalModals'
 
 // Main App component with routing
 function App() {

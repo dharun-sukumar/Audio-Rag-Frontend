@@ -1,69 +1,63 @@
 import { auth } from './firebase';
 import { getIdToken } from 'firebase/auth';
 
-const API_BASE_URL = 'https://transcribe.alterwork.in/api';
+// Use relative path to use Vite's proxy in dev, and Nginx's proxy in prod.
+// This solves CORS issues by keeping requests on the same origin.
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+
+const GUEST_ID_KEY = 'guestId';
+
+/** Get or create a persistent guest ID (for unauthenticated users). */
+export function getOrCreateGuestId() {
+  let guestId = localStorage.getItem(GUEST_ID_KEY);
+  if (!guestId) {
+    guestId = crypto.randomUUID();
+    localStorage.setItem(GUEST_ID_KEY, guestId);
+  }
+  return guestId;
+}
+
+/** Get current guest ID if any (does not create). */
+export function getGuestId() {
+  return localStorage.getItem(GUEST_ID_KEY);
+}
 
 async function getAuthToken(forceRefresh = false) {
   const user = auth.currentUser;
-  if (!user) {
-    console.warn('No user authenticated - cannot get token');
-    return null;
-  }
+  if (!user) return null;
   try {
-    // Get Firebase ID token (always use Firebase, not Google OAuth)
     const token = await getIdToken(user, forceRefresh);
-    if (!token) {
-      console.error('getIdToken returned null/undefined');
-      return null;
-    }
-    console.log('Firebase ID token retrieved:', {
-      length: token.length,
-      preview: `${token.substring(0, 50)}...`,
-      forceRefresh
-    });
-    return token;
+    return token || null;
   } catch (error) {
     console.error('Error getting Firebase auth token:', error);
-    console.error('Error details:', {
-      code: error.code,
-      message: error.message
-    });
     return null;
   }
 }
 
-async function apiRequest(endpoint, options = {}) {
-  // Get Firebase ID token (don't force refresh unless needed - use cached token if valid)
-  let token = await getAuthToken(false);
-  
-  if (!token && endpoint !== '/') {
-    console.warn(`No Firebase auth token available for request to ${endpoint}`);
+/** Returns headers for API: Bearer token if authenticated, else X-Guest-ID. */
+async function getAuthHeaders() {
+  const token = await getAuthToken(false);
+  if (token) {
+    return { authorization: `Bearer ${token.trim()}` };
   }
+  return { 'X-Guest-ID': getOrCreateGuestId() };
+}
 
-  // Build headers - ensure authorization header is properly formatted
+async function apiRequest(endpoint, options = {}) {
+  const authHeaders = await getAuthHeaders();
+  const hasToken = 'authorization' in authHeaders;
+
   const headers = {
     'Content-Type': 'application/json',
+    ...authHeaders,
     ...options.headers,
   };
-  
-  // Add authorization header if token exists
-  if (token) {
-    // Trim token to remove any whitespace and format as Bearer token
-    const cleanToken = token.trim();
-    headers['authorization'] = `Bearer ${cleanToken}`;
-    
-    // Log full token for debugging (user can copy this to test in Insomnia)
-    console.log('🔑 Full token being sent (copy this to test in Insomnia):', cleanToken);
-  }
 
-  // Log token details for debugging (first 50 chars only for security)
-  console.log(`Making ${options.method || 'GET'} request to ${endpoint}`, {
-    hasToken: !!token,
-    tokenLength: token?.length,
-    tokenPreview: token ? `${token.substring(0, 50)}...` : 'none',
-    tokenType: 'Firebase ID Token',
-    authorizationHeader: headers['authorization'] ? `${headers['authorization'].substring(0, 60)}...` : 'missing'
-  });
+  if (hasToken) {
+    console.log(`Making ${options.method || 'GET'} request to ${endpoint}`, { auth: 'Firebase token' });
+  } else if (endpoint !== '/') {
+    console.log(`Making ${options.method || 'GET'} request to ${endpoint}`, { auth: 'guest' });
+  }
 
   let response;
   try {
@@ -112,53 +106,27 @@ async function apiRequest(endpoint, options = {}) {
     throw new Error(`Network error: ${errorMessage}`);
   }
 
-  // If we get a 401, try refreshing the Firebase token
-  if (response.status === 401 && token) {
+  // If we get a 401 and we used a token, try refreshing
+  if (response.status === 401 && hasToken) {
     console.log('Got 401, attempting to refresh Firebase token...');
-    
-    // First, let's see what the error message is
-    let errorData;
-    try {
-      errorData = await response.clone().json();
-      console.error('401 Error details:', errorData);
-    } catch (e) {
-      console.error('Could not parse 401 error response');
-    }
-    
     const user = auth.currentUser;
     if (user) {
       try {
-        // Force refresh Firebase token
-        token = await getIdToken(user, true);
-        if (token) {
-          headers['authorization'] = `Bearer ${token.trim()}`;
-          console.log('Retrying with refreshed Firebase token...', {
-            tokenLength: token.length,
-            tokenPreview: `${token.substring(0, 50)}...`
-          });
-          console.log('🔑 NEW refreshed token (copy to test):', token);
-          
+        const newToken = await getIdToken(user, true);
+        if (newToken) {
+          headers['authorization'] = `Bearer ${newToken.trim()}`;
+          console.log('Retrying with refreshed Firebase token...');
           response = await fetch(`${API_BASE_URL}${endpoint}`, {
             ...options,
             headers,
           });
-          
-          // Log the response status after retry
           console.log('Response after token refresh:', response.status, response.statusText);
-        } else {
-          console.error('Token refresh returned null/undefined');
         }
       } catch (error) {
         console.error('Failed to refresh Firebase token:', error);
       }
-    } else {
-      console.error('No user found when trying to refresh token');
     }
-    
-    // If still 401 after refresh, the token is truly invalid
     if (response.status === 401) {
-      console.error('Firebase token refresh failed, user may need to sign in again');
-      // Try to get the error message
       try {
         const errorText = await response.clone().json();
         console.error('Final 401 error:', errorText);
@@ -169,34 +137,29 @@ async function apiRequest(endpoint, options = {}) {
   }
 
   if (!response.ok) {
+    const responseText = await response.text();
     let errorData;
     try {
-      errorData = await response.json();
-    } catch (parseError) {
-      // If response is not JSON, try to get text
-      try {
-        const text = await response.text();
-        errorData = { detail: text || `HTTP ${response.status} ${response.statusText}` };
-      } catch (textError) {
-        errorData = { detail: `HTTP ${response.status} ${response.statusText}` };
-      }
+      errorData = responseText ? JSON.parse(responseText) : {};
+    } catch {
+      errorData = { detail: responseText || `HTTP ${response.status} ${response.statusText}` };
     }
-    
     const errorMessage = errorData.detail?.[0]?.msg || errorData.detail || errorData.message || `API request failed with status ${response.status}`;
-    
-    // Log detailed error for debugging
+
     console.error('API Error:', {
       endpoint,
       status: response.status,
       statusText: response.statusText,
-      hasToken: !!token,
-      tokenLength: token?.length,
       error: errorMessage,
-      tokenType: 'Firebase ID Token',
       errorData
     });
-    
-    // Provide more helpful error messages
+
+    const isGuestLimit = response.status === 403 && typeof errorMessage === 'string' && errorMessage.toLowerCase().includes('guest limit');
+    if (isGuestLimit) {
+      const err = new Error(errorMessage || 'Guest limit reached. Please log in to continue.');
+      err.guestLimitReached = true;
+      throw err;
+    }
     if (response.status === 500) {
       throw new Error(`Server error (500): ${errorMessage}. The backend may have encountered an internal error.`);
     } else if (response.status === 401) {
@@ -225,11 +188,22 @@ async function apiRequest(endpoint, options = {}) {
 }
 
 export const api = {
-  // Test endpoint to check backend connectivity
-  testConnection: () => 
+  testConnection: () =>
     apiRequest('/', {
       method: 'GET',
     }),
+
+  /** Merge guest data into the current authenticated account. Call after sign-in when guestId existed. */
+  mergeGuestAccount: async (guestId) => {
+    const token = await getAuthToken(false);
+    if (!token) {
+      throw new Error('Must be authenticated to merge guest account');
+    }
+    return apiRequest('/auth/merge-guest', {
+      method: 'POST',
+      body: JSON.stringify({ guest_id: guestId }),
+    });
+  },
 
   askQuestion: (query) => 
     apiRequest('/ask', {
@@ -245,7 +219,7 @@ export const api = {
     }),
 
   listConversations: (skip = 0, limit = 100) => 
-    apiRequest(`/conversations/?skip=${skip}&limit=${limit}`, {
+    apiRequest(`/conversations?skip=${skip}&limit=${limit}`, {
       method: 'GET',
     }),
 
@@ -289,11 +263,8 @@ export const api = {
     }),
 
   // Memory endpoints
-    uploadMemory: async (file, metadata, onProgress) => {
-    const token = await getAuthToken(false);
-    if (!token) {
-      throw new Error('No authentication token available');
-    }
+  uploadMemory: async (file, metadata, onProgress) => {
+    const authHeaders = await getAuthHeaders();
 
     // File size validation (400MB limit - adjust if server allows different)
     const MAX_FILE_SIZE = 400 * 1024 * 1024; // 400MB in bytes
@@ -384,7 +355,11 @@ export const api = {
       
       // Open and send request
       xhr.open('POST', `${API_BASE_URL}/memories/upload`);
-      xhr.setRequestHeader('authorization', `Bearer ${token.trim()}`);
+      if (authHeaders.authorization) {
+        xhr.setRequestHeader('Authorization', authHeaders.authorization);
+      } else if (authHeaders['X-Guest-ID']) {
+        xhr.setRequestHeader('X-Guest-ID', authHeaders['X-Guest-ID']);
+      }
       // Don't set Content-Type - let browser set it with boundary for FormData
       xhr.send(formData);
     });
@@ -397,16 +372,10 @@ export const api = {
     }),
 
   createTextMemory: async (textContent, metadata) => {
-    const token = await getAuthToken(false);
-    if (!token) {
-      throw new Error('No authentication token available');
-    }
+    const authHeaders = await getAuthHeaders();
 
-    // Prepare form data
     const formData = new URLSearchParams();
     formData.append('text_content', textContent);
-    
-    // Only add metadata if it exists and has content
     if (metadata && Object.keys(metadata).length > 0) {
       const metadataString = typeof metadata === 'string' ? metadata : JSON.stringify(metadata);
       formData.append('metadata', metadataString);
@@ -421,7 +390,7 @@ export const api = {
     const response = await fetch(`${API_BASE_URL}/memories/text`, {
       method: 'POST',
       headers: {
-        'authorization': `Bearer ${token.trim()}`,
+        ...authHeaders,
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: formData.toString(),
@@ -483,8 +452,8 @@ export const api = {
       if (tagIdsString) params.append('tag_ids', tagIdsString);
     }
     
-    // Use trailing slash to avoid 307 redirect
-    return apiRequest(`/memories/?${params.toString()}`, {
+    // Use trailing slash only if the backend requires it; otherwise omit
+    return apiRequest(`/memories?${params.toString()}`, {
       method: 'GET',
     });
   },
@@ -525,20 +494,13 @@ export const api = {
   },
 
   getMemoryTextContent: async (memory_id) => {
-    // Get the text content for a text memory from the source_key file
-    // This endpoint returns JSON with a "content" field containing the text
-    const token = await getAuthToken(false);
-    const headers = {
-      'Content-Type': 'application/json',
-    };
-    
-    if (token) {
-      headers['authorization'] = `Bearer ${token.trim()}`;
-    }
-    
+    const authHeaders = await getAuthHeaders();
     const response = await fetch(`${API_BASE_URL}/memories/${memory_id}/text`, {
       method: 'GET',
-      headers,
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders,
+      },
     });
     
     if (!response.ok) {
